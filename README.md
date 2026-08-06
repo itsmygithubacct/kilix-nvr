@@ -28,6 +28,8 @@ when you add the camera, and you can change any of them afterwards:
 | audio record | on / off | off |
 | audio detection | on / off | off |
 | decode size | W×H | camera's substream |
+| container | `mkv` / `mp4` / `mov` | `mkv` |
+| retain days | days this camera keeps | — |
 
 **A newly added camera is viewable and records nothing.** Nothing starts
 consuming disk without being asked for.
@@ -68,6 +70,16 @@ list, because a listed accelerator is not a working one.
 the luma plane of a frame that is already in memory; inference is milliseconds.
 Running the second only when the first finds something bounds the cost by how
 much actually happens rather than by camera count times frame rate.
+
+**Segments are Matroska.** mp4 cannot mux the `pcm_alaw` audio these cameras
+commonly carry — `-c copy` refuses outright — and MPEG-TS accepts it while
+silently dropping the audio stream. mkv keeps both streams byte-exact and
+tolerates a truncated segment, which mp4 does not. Overridable per camera; there
+is no browser here to have an opinion.
+
+**Retention is per-camera days with a global size cap behind it.** Days express
+intent, the cap is the guarantee: a camera that simply gets busier produces more
+bytes for the same number of days, so intent alone does not bound size.
 
 **Recording never re-encodes.** `continuous` adds a second `-c copy` output sink
 to the same ffmpeg process, taking the camera's own packets to disk without ever
