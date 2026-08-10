@@ -9,9 +9,16 @@ protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/), using
 [`kilix-rtsp`](https://github.com/itsmygithubacct/kilix-rtsp) for acquisition
 and presentation.
 
-**Status: design complete, implementation not started.** Nothing here builds
-yet. The sections below describe what is being built and why it is shaped this
-way; they are not a description of working software.
+**Status: it works.** Cameras record, motion gates a detector, events are
+stored and reviewable, retention deletes. Built and verified against live
+cameras. What is not here yet: a trained sound-event model (the classifier
+process and its protocol are), and tracking and zones, which the design
+describes and nothing implements.
+
+```sh
+git submodule update --init --recursive
+make && make test
+```
 
 ## What you configure
 
@@ -97,22 +104,26 @@ disk, and SQLite is an index over them, rebuildable by walking the tree. A
 recorder whose database and storage can disagree needs a reconciliation job that
 stays expensive forever.
 
-## Planned commands
+## Commands
 
 ```sh
 kilix-nvr add       <name> <url>    # onboard a camera; prompts for capabilities
 kilix-nvr set       <name> <k=v>... # change any capability afterwards
 kilix-nvr cameras                   # what exists and what each one is doing
-kilix-nvr run       [camera...]     # the pipeline, honouring each camera's config
+kilix-nvr watch     <name>          # run one camera, honouring its config
 kilix-nvr events    [--since ...]   # query what happened
 kilix-nvr review                    # review interface
 kilix-nvr play      <event|time>    # playback
 kilix-nvr reanalyze <event>         # re-run detection over stored footage
+kilix-nvr clip      <event>         # cut it out of the segments, -c copy
 kilix-nvr prune                     # apply retention
 ```
 
 There is no separate `record` or `detect` command: what a camera does is its
 configuration, not an invocation.
+
+`clip <event>` cuts an event out of the segments without re-encoding, and
+`watch <name>` is what runs one camera in the foreground.
 
 ## Dependencies
 
