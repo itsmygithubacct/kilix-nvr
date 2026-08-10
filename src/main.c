@@ -9,12 +9,14 @@
 
 #include "knvr_config.h"
 #include "knvr_paths.h"
+#include "knvr_watch.h"
 
 #include "kilix_rtsp.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static int usage(FILE *stream)
 {
@@ -26,6 +28,8 @@ static int usage(FILE *stream)
         "  set <name> <k=v>...     change what it does\n"
         "  cameras                 what exists and what each one is doing\n"
         "  remove <name>           forget a camera's policy\n"
+        "  watch <name> [--seconds N] [--render OUT.ppm]\n"
+        "                          decode one camera and report what moves\n"
         "  --selftest              check this build end to end\n"
         "\n"
         "Capabilities: record=off|stills|clips|continuous,\n"
@@ -243,6 +247,8 @@ static int selftest(void)
     return 0;
 }
 
+static int command_watch(knvr_config *config, int argc, char **argv);
+
 int main(int argc, char **argv)
 {
     knvr_config *config = NULL;
@@ -271,6 +277,8 @@ int main(int argc, char **argv)
         status = command_set(config, argc - 2, argv + 2);
     } else if (strcmp(command, "cameras") == 0) {
         status = command_cameras(config);
+    } else if (strcmp(command, "watch") == 0) {
+        status = command_watch(config, argc - 2, argv + 2);
     } else if (strcmp(command, "remove") == 0) {
         status = argc == 3 && knvr_config_remove(config, argv[2]) ? 0 : 1;
         if (status != 0) {
@@ -281,4 +289,196 @@ int main(int argc, char **argv)
     }
     knvr_config_close(config);
     return status;
+}
+
+/* ------------------------------ watch ----------------------------------- */
+
+/*
+ * Resolve a camera's stream URL from kilix-rtsp's config.
+ *
+ * Copied into the caller's buffer and never logged: krtsp_url_redact()
+ * exists because an RTSP URL carries credentials, and the only way to
+ * honour that is for this program never to print one.
+ */
+static bool resolve_url(const char *name, bool prefer_sub, char *out,
+                        size_t size)
+{
+    krtsp_config *config = NULL;
+    char directory[1024];
+    char path[1088];
+    char error[256];
+    bool found = false;
+
+    if (!krtsp_paths_dir("config", directory, sizeof(directory))) {
+        return false;
+    }
+    if (snprintf(path, sizeof(path), "%s/cameras.conf", directory) < 0) {
+        return false;
+    }
+    if (!krtsp_config_load(&config, path, error, sizeof(error))) {
+        (void)fprintf(stderr, "kilix-nvr: %s\n", error);
+        return false;
+    }
+    for (size_t i = 0u; i < krtsp_config_camera_count(config); i++) {
+        const krtsp_camera *camera = krtsp_config_camera_at(config, i);
+
+        if (camera == NULL || strcmp(camera->name, name) != 0) {
+            continue;
+        }
+        {
+            const char *url = prefer_sub && camera->url_sub[0] != '\0'
+                                  ? camera->url_sub : camera->url_main;
+
+            if (url[0] != '\0' && strlen(url) < size) {
+                (void)snprintf(out, size, "%s", url);
+                found = true;
+            }
+        }
+        break;
+    }
+    krtsp_config_free(config);
+    return found;
+}
+
+static int write_ppm(const char *path, const uint8_t *bgra, int width,
+                     int height)
+{
+    FILE *file = fopen(path, "wb");
+
+    if (file == NULL) {
+        return 1;
+    }
+    (void)fprintf(file, "P6\n%d %d\n255\n", width, height);
+    for (int i = 0; i < width * height; i++) {
+        /* BGRA in, RGB out. */
+        (void)fputc(bgra[i * 4 + 2], file);
+        (void)fputc(bgra[i * 4 + 1], file);
+        (void)fputc(bgra[i * 4 + 0], file);
+    }
+    return fclose(file) == 0 ? 0 : 1;
+}
+
+static int command_watch(knvr_config *config, int argc, char **argv)
+{
+    knvr_watch_options options;
+    knvr_watch *watch = NULL;
+    knvr_watch_stats stats;
+    knvr_camera camera;
+    knvr_box boxes[KNVR_MOTION_BOX_MAX];
+    char url[KRTSP_URL_MAX];
+    char mask_path[KNVR_PATH_MAX];
+    char log_path[KNVR_PATH_MAX];
+    const char *render = NULL;
+    const char *name;
+    int seconds = 10;
+    int rendered = 0;
+    time_t deadline;
+
+    if (argc < 1) {
+        return usage(stderr);
+    }
+    name = argv[0];
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--seconds") == 0 && i + 1 < argc) {
+            seconds = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--render") == 0 && i + 1 < argc) {
+            render = argv[++i];
+        } else {
+            return usage(stderr);
+        }
+    }
+    if (seconds <= 0 || seconds > 86400) {
+        (void)fprintf(stderr, "kilix-nvr: --seconds is 1 to 86400\n");
+        return 1;
+    }
+    if (!knvr_config_get(config, name, &camera)) {
+        (void)fprintf(stderr,
+                      "kilix-nvr: no policy for '%s'; add it first\n", name);
+        return 1;
+    }
+    if (!resolve_url(name, true, url, sizeof(url))) {
+        (void)fprintf(stderr,
+                      "kilix-nvr: no stream URL for '%s' in cameras.conf\n",
+                      name);
+        return 1;
+    }
+
+    knvr_watch_options_init(&options);
+    /* ffmpeg's stderr goes to a file, never the terminal: one warning in
+     * the alternate screen corrupts the display, and a flaky camera
+     * produces plenty. */
+    if (knvr_paths_state_file(log_path, sizeof(log_path), "ffmpeg.log")) {
+        options.log_path = log_path;
+    }
+    if (camera.mask[0] != '\0') {
+        char masks[KNVR_PATH_MAX];
+
+        if (knvr_paths_subdir(masks, sizeof(masks), "masks") &&
+            snprintf(mask_path, sizeof(mask_path), "%s/%s", masks,
+                     camera.mask) > 0) {
+            options.mask_path = mask_path;
+        }
+    }
+    if (!knvr_watch_start(&watch, url, &options)) {
+        (void)fprintf(stderr, "kilix-nvr: %s: %s\n", name,
+                      knvr_watch_error(watch) != NULL
+                          ? knvr_watch_error(watch)
+                          : "could not start the camera");
+        knvr_watch_stop(watch);
+        return 1;
+    }
+    (void)printf("watching %s at %dx%d for %ds%s\n", name,
+                 knvr_watch_width(watch), knvr_watch_height(watch), seconds,
+                 options.mask_path != NULL ? " (masked)" : "");
+
+    deadline = time(NULL) + seconds;
+    while (time(NULL) < deadline) {
+        const uint8_t *frame = NULL;
+        size_t count = 0u;
+
+        if (!knvr_watch_step(watch, &frame, boxes, KNVR_MOTION_BOX_MAX,
+                             &count)) {
+            struct timespec pause = {0, 100 * 1000 * 1000};
+
+            (void)nanosleep(&pause, NULL);
+            continue;
+        }
+        if (count > 0u) {
+            (void)printf("  motion: %zu region%s\n", count,
+                         count == 1u ? "" : "s");
+            /* The first frame with motion is the one worth looking at,
+             * so that is the one written. */
+            if (render != NULL && rendered == 0) {
+                uint8_t *copy = malloc((size_t)knvr_watch_width(watch) *
+                                       (size_t)knvr_watch_height(watch) * 4u);
+
+                if (copy != NULL) {
+                    (void)memcpy(copy, frame,
+                                 (size_t)knvr_watch_width(watch) *
+                                     (size_t)knvr_watch_height(watch) * 4u);
+                    knvr_watch_draw_boxes(copy, knvr_watch_width(watch),
+                                          knvr_watch_height(watch), boxes,
+                                          count);
+                    if (write_ppm(render, copy, knvr_watch_width(watch),
+                                  knvr_watch_height(watch)) == 0) {
+                        (void)printf("  wrote %s\n", render);
+                        rendered = 1;
+                    }
+                    free(copy);
+                }
+            }
+        }
+        {
+            struct timespec pause = {0, 30 * 1000 * 1000};
+
+            (void)nanosleep(&pause, NULL);
+        }
+    }
+    knvr_watch_get_stats(watch, &stats);
+    (void)printf("%llu frames, %llu with motion, %llu boxes, newest %dms old\n",
+                 (unsigned long long)stats.frames,
+                 (unsigned long long)stats.motion_frames,
+                 (unsigned long long)stats.boxes, stats.last_age_ms);
+    knvr_watch_stop(watch);
+    return 0;
 }
