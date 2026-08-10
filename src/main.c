@@ -9,6 +9,7 @@
 
 #include "knvr_config.h"
 #include "knvr_paths.h"
+#include "knvr_store.h"
 #include "knvr_watch.h"
 
 #include "kilix_rtsp.h"
@@ -29,7 +30,12 @@ static int usage(FILE *stream)
         "  cameras                 what exists and what each one is doing\n"
         "  remove <name>           forget a camera's policy\n"
         "  watch <name> [--seconds N] [--render OUT.ppm]\n"
-        "                          decode one camera and report what moves\n"
+        "                          decode one camera and record what moves\n"
+        "  events [--since SECONDS] [--camera NAME] [--min-score S]\n"
+        "                          what happened\n"
+        "  prune [--dry-run] [--cap-mb N]\n"
+        "                          apply retention: per-camera days, then\n"
+        "                          a global size cap behind it\n"
         "  --selftest              check this build end to end\n"
         "\n"
         "Capabilities: record=off|stills|clips|continuous,\n"
@@ -177,6 +183,8 @@ static int command_cameras(knvr_config *config)
     return 0;
 }
 
+#define QUIET_SECONDS 5
+
 #define TEST(name, condition)                                                 \
     do {                                                                      \
         const bool passed = (condition);                                      \
@@ -248,6 +256,8 @@ static int selftest(void)
 }
 
 static int command_watch(knvr_config *config, int argc, char **argv);
+static int command_events(int argc, char **argv);
+static int command_prune(knvr_config *config, int argc, char **argv);
 
 int main(int argc, char **argv)
 {
@@ -279,6 +289,10 @@ int main(int argc, char **argv)
         status = command_cameras(config);
     } else if (strcmp(command, "watch") == 0) {
         status = command_watch(config, argc - 2, argv + 2);
+    } else if (strcmp(command, "events") == 0) {
+        status = command_events(argc - 2, argv + 2);
+    } else if (strcmp(command, "prune") == 0) {
+        status = command_prune(config, argc - 2, argv + 2);
     } else if (strcmp(command, "remove") == 0) {
         status = argc == 3 && knvr_config_remove(config, argv[2]) ? 0 : 1;
         if (status != 0) {
@@ -361,7 +375,10 @@ static int write_ppm(const char *path, const uint8_t *bgra, int width,
 static int command_watch(knvr_config *config, int argc, char **argv)
 {
     knvr_watch_options options;
+    knvr_store *store = NULL;
     knvr_watch *watch = NULL;
+    int64_t event_id = 0;
+    time_t last_motion = 0;
     knvr_watch_stats stats;
     knvr_camera camera;
     knvr_box boxes[KNVR_MOTION_BOX_MAX];
@@ -431,6 +448,16 @@ static int command_watch(knvr_config *config, int argc, char **argv)
                  knvr_watch_width(watch), knvr_watch_height(watch), seconds,
                  options.mask_path != NULL ? " (masked)" : "");
 
+    if (!knvr_store_open(&store, NULL)) {
+        (void)fprintf(stderr, "kilix-nvr: cannot open the event store\n");
+        knvr_watch_stop(watch);
+        return 1;
+    }
+    /* Anything this camera left open belongs to a previous run.  An event
+     * with no end time never appears in a query bounded by when it
+     * finished, so a crash must not leave one behind. */
+    (void)knvr_store_close_stale(store, name, (int64_t)time(NULL));
+
     deadline = time(NULL) + seconds;
     while (time(NULL) < deadline) {
         const uint8_t *frame = NULL;
@@ -444,6 +471,18 @@ static int command_watch(knvr_config *config, int argc, char **argv)
             continue;
         }
         if (count > 0u) {
+            const int64_t at = (int64_t)time(NULL);
+
+            if (event_id == 0) {
+                if (knvr_store_event_open(store, name, KNVR_TRIGGER_MOTION,
+                                          at, &event_id)) {
+                    (void)printf("  event %lld opened\n",
+                                 (long long)event_id);
+                }
+            } else {
+                (void)knvr_store_event_touch(store, event_id);
+            }
+            last_motion = (time_t)at;
             (void)printf("  motion: %zu region%s\n", count,
                          count == 1u ? "" : "s");
             /* The first frame with motion is the one worth looking at,
@@ -467,6 +506,15 @@ static int command_watch(knvr_config *config, int argc, char **argv)
                     free(copy);
                 }
             }
+        } else if (event_id != 0 &&
+                   time(NULL) - last_motion >= QUIET_SECONDS) {
+            /* Quiet for long enough to call it over.  Closing on the very
+             * next still frame would split one person walking past into a
+             * dozen events. */
+            (void)knvr_store_event_close(store, event_id,
+                                         (int64_t)time(NULL));
+            (void)printf("  event %lld closed\n", (long long)event_id);
+            event_id = 0;
         }
         {
             struct timespec pause = {0, 30 * 1000 * 1000};
@@ -474,11 +522,158 @@ static int command_watch(knvr_config *config, int argc, char **argv)
             (void)nanosleep(&pause, NULL);
         }
     }
+    if (event_id != 0) {
+        (void)knvr_store_event_close(store, event_id, (int64_t)time(NULL));
+    }
     knvr_watch_get_stats(watch, &stats);
     (void)printf("%llu frames, %llu with motion, %llu boxes, newest %dms old\n",
                  (unsigned long long)stats.frames,
                  (unsigned long long)stats.motion_frames,
                  (unsigned long long)stats.boxes, stats.last_age_ms);
     knvr_watch_stop(watch);
+    knvr_store_close(store);
+    return 0;
+}
+
+/* ------------------------- events and retention -------------------------- */
+
+static void print_when(int64_t at, char *out, size_t size)
+{
+    /* Stored UTC, shown local.  The conversion happens here, once: the
+     * archive this was measured against is UTC while the machine is
+     * UTC-7, and a "night" sample taken by local hour was an afternoon
+     * one. */
+    const time_t when = (time_t)at;
+    struct tm parts;
+
+    if (localtime_r(&when, &parts) == NULL) {
+        (void)snprintf(out, size, "?");
+        return;
+    }
+    (void)strftime(out, size, "%Y-%m-%d %H:%M:%S", &parts);
+}
+
+static int command_events(int argc, char **argv)
+{
+    knvr_store *store = NULL;
+    knvr_query query;
+    knvr_event events[256];
+    size_t count = 0u;
+
+    knvr_query_init(&query);
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--since") == 0 && i + 1 < argc) {
+            query.since = (int64_t)time(NULL) - atoll(argv[++i]);
+        } else if (strcmp(argv[i], "--camera") == 0 && i + 1 < argc) {
+            (void)snprintf(query.camera, sizeof(query.camera), "%s",
+                           argv[++i]);
+        } else if (strcmp(argv[i], "--min-score") == 0 && i + 1 < argc) {
+            query.min_score = atof(argv[++i]);
+        } else {
+            return usage(stderr);
+        }
+    }
+    if (!knvr_store_open(&store, NULL)) {
+        (void)fprintf(stderr, "kilix-nvr: cannot open the event store\n");
+        return 1;
+    }
+    if (!knvr_store_events(store, &query, events, 256u, &count)) {
+        (void)fprintf(stderr, "kilix-nvr: cannot query events\n");
+        knvr_store_close(store);
+        return 1;
+    }
+    if (count == 0u) {
+        (void)printf("nothing happened\n");
+        knvr_store_close(store);
+        return 0;
+    }
+    (void)printf("%-6s %-14s %-20s %-8s %-7s %s\n", "ID", "CAMERA", "STARTED",
+                 "LASTED", "FRAMES", "BEST");
+    for (size_t i = 0u; i < count && i < 256u; i++) {
+        const knvr_event *event = &events[i];
+        char started[32];
+        char lasted[24];
+        char best[48];
+
+        print_when(event->started, started, sizeof(started));
+        if (event->ended > 0) {
+            (void)snprintf(lasted, sizeof(lasted), "%llds",
+                           (long long)(event->ended - event->started));
+        } else {
+            (void)snprintf(lasted, sizeof(lasted), "open");
+        }
+        if (event->best_score > 0.0) {
+            (void)snprintf(best, sizeof(best), "%s %.2f", event->best_label,
+                           event->best_score);
+        } else {
+            (void)snprintf(best, sizeof(best), "-");
+        }
+        (void)printf("%-6lld %-14s %-20s %-8s %-7lld %s\n",
+                     (long long)event->id, event->camera, started, lasted,
+                     (long long)event->motion_frames, best);
+    }
+    if (count > 256u) {
+        (void)printf("... and %zu more\n", count - 256u);
+    }
+    knvr_store_close(store);
+    return 0;
+}
+
+static int command_prune(knvr_config *config, int argc, char **argv)
+{
+    knvr_store *store = NULL;
+    knvr_camera cameras[KNVR_CAMERA_MAX];
+    knvr_prune_result result;
+    size_t count = 0u;
+    size_t events_removed = 0u;
+    uint64_t bytes_freed = 0u;
+    uint64_t cap_bytes = 0u;
+    bool dry_run = false;
+
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--dry-run") == 0) {
+            dry_run = true;
+        } else if (strcmp(argv[i], "--cap-mb") == 0 && i + 1 < argc) {
+            cap_bytes = (uint64_t)atoll(argv[++i]) * 1024u * 1024u;
+        } else {
+            return usage(stderr);
+        }
+    }
+    if (!knvr_config_list(config, cameras, KNVR_CAMERA_MAX, &count)) {
+        (void)fprintf(stderr, "kilix-nvr: cannot list cameras\n");
+        return 1;
+    }
+    if (!knvr_store_open(&store, NULL)) {
+        (void)fprintf(stderr, "kilix-nvr: cannot open the event store\n");
+        return 1;
+    }
+    /* Per-camera age first, the global cap behind it.  A size cap alone
+     * silently shortens the retention of whichever camera is busiest. */
+    for (size_t i = 0u; i < count && i < KNVR_CAMERA_MAX; i++) {
+        knvr_retention rule;
+
+        if (cameras[i].retain_days <= 0) {
+            continue;
+        }
+        (void)memset(&rule, 0, sizeof(rule));
+        rule.days = cameras[i].retain_days;
+        (void)snprintf(rule.camera, sizeof(rule.camera), "%.*s",
+                       (int)sizeof(rule.camera) - 1, cameras[i].name);
+        if (knvr_store_prune_age(store, &rule, (int64_t)time(NULL), dry_run,
+                                 &result)) {
+            events_removed += result.events_removed;
+            bytes_freed += result.bytes_freed;
+        }
+    }
+    if (cap_bytes > 0u &&
+        knvr_store_prune_size(store, cap_bytes, dry_run, &result)) {
+        events_removed += result.events_removed;
+        bytes_freed += result.bytes_freed;
+    }
+    (void)printf("%s %zu event%s, %.1f MB\n",
+                 dry_run ? "would remove" : "removed", events_removed,
+                 events_removed == 1u ? "" : "s",
+                 (double)bytes_freed / (1024.0 * 1024.0));
+    knvr_store_close(store);
     return 0;
 }
