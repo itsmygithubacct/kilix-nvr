@@ -8,6 +8,7 @@
  */
 
 #include "knvr_config.h"
+#include "knvr_detect.h"
 #include "knvr_paths.h"
 #include "knvr_store.h"
 #include "knvr_watch.h"
@@ -372,10 +373,42 @@ static int write_ppm(const char *path, const uint8_t *bgra, int width,
     return fclose(file) == 0 ? 0 : 1;
 }
 
+/*
+ * One frame of the event, on disk and indexed.
+ *
+ * Written once per event rather than per detection: twenty stills of the
+ * same person crossing the same yard is a directory nobody reads.
+ */
+static void save_still(knvr_store *store, int64_t event_id,
+                       const char *camera, const uint8_t *frame, int width,
+                       int height)
+{
+    char directory[KNVR_PATH_MAX];
+    char path[KNVR_PATH_MAX];
+    static int64_t last_event;
+
+    if (event_id == 0 || event_id == last_event) {
+        return;
+    }
+    if (!knvr_paths_subdir(directory, sizeof(directory), "media")) {
+        return;
+    }
+    if (snprintf(path, sizeof(path), "%s/%s-%lld.ppm", directory, camera,
+                 (long long)event_id) < 0) {
+        return;
+    }
+    if (write_ppm(path, frame, width, height) == 0) {
+        (void)knvr_store_add_media(store, event_id, "still", path);
+        (void)printf("    still %s\n", path);
+        last_event = event_id;
+    }
+}
+
 static int command_watch(knvr_config *config, int argc, char **argv)
 {
     knvr_watch_options options;
     knvr_store *store = NULL;
+    knvr_detector *detector = NULL;
     knvr_watch *watch = NULL;
     int64_t event_id = 0;
     time_t last_motion = 0;
@@ -448,6 +481,20 @@ static int command_watch(knvr_config *config, int argc, char **argv)
                  knvr_watch_width(watch), knvr_watch_height(watch), seconds,
                  options.mask_path != NULL ? " (masked)" : "");
 
+    /* `always` runs it.  `on-view` is blind with no viewer attached, and
+     * `cameras` is the one place that says so. */
+    if (camera.detect == KNVR_DETECT_ALWAYS) {
+        knvr_detector_options detector_options;
+
+        knvr_detector_options_init(&detector_options);
+        detector_options.width = knvr_watch_width(watch);
+        detector_options.height = knvr_watch_height(watch);
+        if (!knvr_detector_start(&detector, &detector_options)) {
+            /* A degradation, not a fault: motion-only still records. */
+            (void)fprintf(stderr,
+                          "kilix-nvr: %s: no detector; motion only\n", name);
+        }
+    }
     if (!knvr_store_open(&store, NULL)) {
         (void)fprintf(stderr, "kilix-nvr: cannot open the event store\n");
         knvr_watch_stop(watch);
@@ -485,6 +532,45 @@ static int command_watch(knvr_config *config, int argc, char **argv)
             last_motion = (time_t)at;
             (void)printf("  motion: %zu region%s\n", count,
                          count == 1u ? "" : "s");
+
+            /* Gated on motion, which is the whole CPU story: inference is
+             * 7-36 ms, differencing a downscaled frame is arithmetic. */
+            if (detector != NULL) {
+                knvr_detection_box found[KNVR_DETECT_ROWS];
+                size_t detections = 0u;
+
+                if (knvr_detector_run(detector, frame, found,
+                                      KNVR_DETECT_ROWS, &detections)) {
+                    for (size_t d = 0u; d < detections; d++) {
+                        knvr_detection record;
+
+                        (void)memset(&record, 0, sizeof(record));
+                        record.event = event_id;
+                        record.at = at;
+                        (void)snprintf(record.label, sizeof(record.label),
+                                       "%s",
+                                       knvr_detect_label(found[d].class_id));
+                        record.score = (double)found[d].score;
+                        record.x = found[d].x;
+                        record.y = found[d].y;
+                        record.w = found[d].w;
+                        record.h = found[d].h;
+                        (void)knvr_store_add_detection(store, &record);
+                        (void)printf("    %s %.2f\n", record.label,
+                                     record.score);
+                    }
+                    if (detections > 0u && camera.record != KNVR_RECORD_OFF) {
+                        save_still(store, event_id, name, frame,
+                                   knvr_watch_width(watch),
+                                   knvr_watch_height(watch));
+                    }
+                } else if (knvr_detector_error(detector) != NULL) {
+                    (void)fprintf(stderr, "kilix-nvr: %s: %s\n", name,
+                                  knvr_detector_error(detector));
+                    knvr_detector_stop(detector);
+                    detector = NULL;
+                }
+            }
             /* The first frame with motion is the one worth looking at,
              * so that is the one written. */
             if (render != NULL && rendered == 0) {
@@ -531,6 +617,7 @@ static int command_watch(knvr_config *config, int argc, char **argv)
                  (unsigned long long)stats.motion_frames,
                  (unsigned long long)stats.boxes, stats.last_age_ms);
     knvr_watch_stop(watch);
+    knvr_detector_stop(detector);
     knvr_store_close(store);
     return 0;
 }
