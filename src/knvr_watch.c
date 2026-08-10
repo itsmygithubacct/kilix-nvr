@@ -30,6 +30,7 @@
 
 struct knvr_watch {
     krtsp_source *source;
+    krtsp_source *recorder;   /* RECORD-only, main stream, never decodes */
     kmd_detector *detector;
     int width;
     int height;
@@ -178,10 +179,44 @@ bool knvr_watch_start(
     source_options.letterbox = true;
     source_options.low_latency = true;
     source_options.log_path = options->log_path;
+    if (options->record_dir != NULL && options->record_dir[0] != '\0' &&
+        (options->record_url == NULL || options->record_url[0] == '\0')) {
+        /* No separate archive stream: both roles on this process, which
+         * means the archive is whatever this decodes. */
+        source_options.roles = KRTSP_ROLE_DECODE | KRTSP_ROLE_RECORD;
+        source_options.record_dir = options->record_dir;
+        source_options.segment_seconds = options->segment_seconds;
+        source_options.record_audio = options->record_audio;
+    }
     if (!krtsp_source_start(&watch->source, url, &source_options)) {
         kmd_detector_free(watch->detector);
         free(watch);
         return false;
+    }
+
+    if (options->record_dir != NULL && options->record_dir[0] != '\0' &&
+        options->record_url != NULL && options->record_url[0] != '\0') {
+        krtsp_source_options archive;
+
+        /* RECORD without DECODE: the segmenter copies the camera's own
+         * bitstream, so this second process costs I/O and no CPU.  It is
+         * what keeps the archive full quality while motion differences
+         * the substream. */
+        krtsp_source_options_init(&archive);
+        archive.roles = KRTSP_ROLE_RECORD;
+        archive.width = options->width;
+        archive.height = options->height;
+        archive.record_dir = options->record_dir;
+        archive.segment_seconds = options->segment_seconds;
+        archive.record_audio = options->record_audio;
+        archive.log_path = options->log_path;
+        if (!krtsp_source_start(&watch->recorder, options->record_url,
+                                &archive)) {
+            /* Losing the archive must not lose the detection: the camera
+             * carries on and the caller is told. */
+            (void)fail(watch, "the archive stream could not be started");
+            watch->recorder = NULL;
+        }
     }
     *out = watch;
     return true;
@@ -196,6 +231,7 @@ void knvr_watch_stop(knvr_watch *watch)
         krtsp_source_release(watch->source);
     }
     krtsp_source_stop(watch->source);
+    krtsp_source_stop(watch->recorder);
     kmd_detector_free(watch->detector);
     free(watch);
 }

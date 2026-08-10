@@ -49,6 +49,24 @@ typedef struct knvr_watch_options {
      * polarity kmd_detector_set_mask() wants, so neither side inverts. */
     const char *mask_path;
 
+    /*
+     * Continuous recording target, or NULL for none.
+     *
+     * When `record_url` is also set, the archive is written by its own
+     * ffmpeg reading the camera's MAIN stream while motion keeps
+     * differencing the substream.  That second process never decodes -
+     * it copies the camera's own bitstream to disk - so it costs I/O and
+     * nothing else, and it is the reason the archive is full quality
+     * while the differencing stays cheap.
+     *
+     * With `record_url` NULL the archive comes off the same stream this
+     * decodes, which is one process but substream quality.
+     */
+    const char *record_url;
+    const char *record_dir;
+    int segment_seconds;
+    bool record_audio;
+
     /* Where ffmpeg's stderr goes.  NULL discards it, and it must never be
      * the terminal: one warning printed into the alternate screen corrupts
      * the display, and a flaky camera produces plenty. */

@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 static int usage(FILE *stream)
@@ -459,6 +460,27 @@ static int command_watch(knvr_config *config, int argc, char **argv)
      * produces plenty. */
     if (knvr_paths_state_file(log_path, sizeof(log_path), "ffmpeg.log")) {
         options.log_path = log_path;
+    }
+    if (camera.record == KNVR_RECORD_CONTINUOUS) {
+        static char record_dir[KNVR_PATH_MAX];
+        static char record_url[KRTSP_URL_MAX];
+        char segments[KNVR_PATH_MAX];
+
+        /* The main stream for the archive, the substream for motion.
+         * Full-quality footage without decoding it. */
+        if (resolve_url(name, false, record_url, sizeof(record_url))) {
+            options.record_url = record_url;
+        }
+        if (knvr_paths_subdir(segments, sizeof(segments), "segments") &&
+            snprintf(record_dir, sizeof(record_dir), "%s/%s", segments,
+                     name) > 0) {
+            (void)mkdir(record_dir, 0700);
+            options.record_dir = record_dir;
+            /* Matroska by default, measured: pcm_alaw survives -c copy
+             * untouched, which mp4 cannot promise. */
+            options.segment_seconds = 60;
+            options.record_audio = camera.audio;
+        }
     }
     if (camera.mask[0] != '\0') {
         char masks[KNVR_PATH_MAX];
