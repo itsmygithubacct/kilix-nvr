@@ -10,6 +10,7 @@
 #include "knvr_config.h"
 #include "knvr_detect.h"
 #include "knvr_paths.h"
+#include "knvr_review.h"
 #include "knvr_store.h"
 #include "knvr_watch.h"
 
@@ -35,6 +36,8 @@ static int usage(FILE *stream)
         "                          decode one camera and record what moves\n"
         "  events [--since SECONDS] [--camera NAME] [--min-score S]\n"
         "                          what happened\n"
+        "  review                  browse events with the frame that caused\n"
+        "                          them; up/down to select, q to quit\n"
         "  prune [--dry-run] [--cap-mb N]\n"
         "                          apply retention: per-camera days, then\n"
         "                          a global size cap behind it\n"
@@ -293,6 +296,16 @@ int main(int argc, char **argv)
         status = command_watch(config, argc - 2, argv + 2);
     } else if (strcmp(command, "events") == 0) {
         status = command_events(argc - 2, argv + 2);
+    } else if (strcmp(command, "review") == 0) {
+        knvr_store *store = NULL;
+
+        if (!knvr_store_open(&store, NULL)) {
+            (void)fprintf(stderr, "kilix-nvr: cannot open the event store\n");
+            status = 1;
+        } else {
+            status = knvr_review(store);
+            knvr_store_close(store);
+        }
     } else if (strcmp(command, "prune") == 0) {
         status = command_prune(config, argc - 2, argv + 2);
     } else if (strcmp(command, "remove") == 0) {
