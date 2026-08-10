@@ -11,6 +11,9 @@
 #include "knvr_detect.h"
 #include "knvr_paths.h"
 #include "knvr_review.h"
+#include "knvr_sound.h"
+
+#include "soft_raster.h"
 #include "knvr_store.h"
 #include "knvr_watch.h"
 
@@ -19,7 +22,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
+#include <unistd.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 
 static int usage(FILE *stream)
@@ -38,6 +44,9 @@ static int usage(FILE *stream)
         "                          what happened\n"
         "  review                  browse events with the frame that caused\n"
         "                          them; up/down to select, q to quit\n"
+        "  play <event>            print the footage covering an event\n"
+        "  clip <event>            cut it out of the segments, no re-encode\n"
+        "  reanalyze <event>       run the detector over its still again\n"
         "  prune [--dry-run] [--cap-mb N]\n"
         "                          apply retention: per-camera days, then\n"
         "                          a global size cap behind it\n"
@@ -263,6 +272,9 @@ static int selftest(void)
 static int command_watch(knvr_config *config, int argc, char **argv);
 static int command_events(int argc, char **argv);
 static int command_prune(knvr_config *config, int argc, char **argv);
+static int command_play(int argc, char **argv);
+static int command_clip(int argc, char **argv);
+static int command_reanalyze(int argc, char **argv);
 
 int main(int argc, char **argv)
 {
@@ -306,6 +318,12 @@ int main(int argc, char **argv)
             status = knvr_review(store);
             knvr_store_close(store);
         }
+    } else if (strcmp(command, "play") == 0) {
+        status = command_play(argc - 2, argv + 2);
+    } else if (strcmp(command, "clip") == 0) {
+        status = command_clip(argc - 2, argv + 2);
+    } else if (strcmp(command, "reanalyze") == 0) {
+        status = command_reanalyze(argc - 2, argv + 2);
     } else if (strcmp(command, "prune") == 0) {
         status = command_prune(config, argc - 2, argv + 2);
     } else if (strcmp(command, "remove") == 0) {
@@ -423,6 +441,7 @@ static int command_watch(knvr_config *config, int argc, char **argv)
     knvr_watch_options options;
     knvr_store *store = NULL;
     knvr_detector *detector = NULL;
+    knvr_sound *sound = NULL;
     knvr_watch *watch = NULL;
     int64_t event_id = 0;
     time_t last_motion = 0;
@@ -432,6 +451,7 @@ static int command_watch(knvr_config *config, int argc, char **argv)
     char url[KRTSP_URL_MAX];
     char mask_path[KNVR_PATH_MAX];
     char log_path[KNVR_PATH_MAX];
+    char sound_log[KNVR_PATH_MAX];
     const char *render = NULL;
     const char *name;
     int seconds = 10;
@@ -515,6 +535,28 @@ static int command_watch(knvr_config *config, int argc, char **argv)
     (void)printf("watching %s at %dx%d for %ds%s\n", name,
                  knvr_watch_width(watch), knvr_watch_height(watch), seconds,
                  options.mask_path != NULL ? " (masked)" : "");
+
+
+    if (camera.sound_events) {
+        knvr_sound_options sound_options;
+        static char sound_url[KRTSP_URL_MAX];
+
+        knvr_sound_options_init(&sound_options);
+        /* Its own log.  Two ffmpegs sharing one file makes "which of them
+         * is complaining" a guess, and the audio one complains loudly on
+         * a camera that carries no audio at all. */
+        if (knvr_paths_state_file(sound_log, sizeof(sound_log),
+                                  "ffmpeg-audio.log")) {
+            sound_options.log_path = sound_log;
+        }
+        /* The main stream, which is where the audio is: substreams
+         * frequently carry none at all. */
+        if (resolve_url(name, false, sound_url, sizeof(sound_url)) &&
+            !knvr_sound_start(&sound, sound_url, &sound_options)) {
+            (void)fprintf(stderr,
+                          "kilix-nvr: %s: no listener; sight only\n", name);
+        }
+    }
 
     /* `always` runs it.  `on-view` is blind with no viewer attached, and
      * `cameras` is the one place that says so. */
@@ -637,6 +679,46 @@ static int command_watch(knvr_config *config, int argc, char **argv)
             (void)printf("  event %lld closed\n", (long long)event_id);
             event_id = 0;
         }
+        if (sound != NULL) {
+            knvr_sound_event heard[8];
+            size_t heard_count = 0u;
+
+            if (knvr_sound_step(sound, heard, 8u, &heard_count)) {
+                for (size_t h = 0u; h < heard_count; h++) {
+                    knvr_detection record;
+                    int64_t sound_event = event_id;
+
+                    /* A sound with nothing moving still deserves an
+                     * event: a noise in the dark is exactly what a motion
+                     * gate cannot see. */
+                    if (sound_event == 0 &&
+                        knvr_store_event_open(store, name,
+                                              KNVR_TRIGGER_SOUND,
+                                              (int64_t)time(NULL),
+                                              &sound_event)) {
+                        event_id = sound_event;
+                        last_motion = time(NULL);
+                    }
+                    (void)memset(&record, 0, sizeof(record));
+                    record.event = sound_event;
+                    record.at = (int64_t)time(NULL);
+                    (void)snprintf(record.label, sizeof(record.label), "%s",
+                                   knvr_sound_label(heard[h].class_id));
+                    record.score = (double)heard[h].score;
+                    (void)knvr_store_add_detection(store, &record);
+                    (void)printf("    heard %s %.2f\n", record.label,
+                                 record.score);
+                }
+            } else if (knvr_sound_error(sound) != NULL) {
+                /* Once, then sight-only.  A camera with no audio stream
+                 * at all reaches here immediately, and repeating it every
+                 * second would bury everything else. */
+                (void)fprintf(stderr, "kilix-nvr: %s: %s; sight only\n",
+                              name, knvr_sound_error(sound));
+                knvr_sound_stop(sound);
+                sound = NULL;
+            }
+        }
         {
             struct timespec pause = {0, 30 * 1000 * 1000};
 
@@ -653,6 +735,7 @@ static int command_watch(knvr_config *config, int argc, char **argv)
                  (unsigned long long)stats.boxes, stats.last_age_ms);
     knvr_watch_stop(watch);
     knvr_detector_stop(detector);
+    knvr_sound_stop(sound);
     knvr_store_close(store);
     return 0;
 }
@@ -798,4 +881,307 @@ static int command_prune(knvr_config *config, int argc, char **argv)
                  (double)bytes_freed / (1024.0 * 1024.0));
     knvr_store_close(store);
     return 0;
+}
+
+/* --------------------- clips, playback and reanalyze --------------------- */
+
+/*
+ * The segment covering a moment, or empty.
+ *
+ * Segments are named by their start time, so the one that contains an
+ * event is the newest whose name is not after it.  Reading the directory
+ * beats indexing them: the segmenter writes files without telling anyone,
+ * and an index that can disagree with the disk is worse than no index.
+ */
+static bool segment_covering(const char *camera, int64_t at, char *out,
+                             size_t size)
+{
+    char directory[KNVR_PATH_MAX];
+    char segments[KNVR_PATH_MAX];
+    DIR *handle;
+    struct dirent *entry;
+    time_t best = 0;
+    bool found = false;
+
+    if (!knvr_paths_subdir(segments, sizeof(segments), "segments")) {
+        return false;
+    }
+    if (snprintf(directory, sizeof(directory), "%s/%s", segments, camera) < 0) {
+        return false;
+    }
+    handle = opendir(directory);
+    if (handle == NULL) {
+        return false;
+    }
+    while ((entry = readdir(handle)) != NULL) {
+        char candidate[KNVR_PATH_MAX];
+        struct stat info;
+
+        if (entry->d_name[0] == '.') {
+            continue;
+        }
+        if (snprintf(candidate, sizeof(candidate), "%s/%s", directory,
+                     entry->d_name) < 0) {
+            continue;
+        }
+        if (stat(candidate, &info) != 0 || !S_ISREG(info.st_mode)) {
+            continue;
+        }
+        /* mtime is when the segment was closed, so a segment covers the
+         * window ending there.  Its start is what matters, and the
+         * closest one at or before the event is the answer. */
+        if (info.st_mtime <= (time_t)at + 90 && info.st_mtime > best) {
+            best = info.st_mtime;
+            (void)snprintf(out, size, "%s", candidate);
+            found = true;
+        }
+    }
+    (void)closedir(handle);
+    return found;
+}
+
+static int command_play(int argc, char **argv)
+{
+    knvr_store *store = NULL;
+    knvr_query query;
+    knvr_event events[64];
+    knvr_media media[8];
+    size_t count = 0u;
+    size_t media_count = 0u;
+    int64_t wanted;
+    char segment[KNVR_PATH_MAX];
+    const char *target = NULL;
+
+    if (argc != 1) {
+        return usage(stderr);
+    }
+    wanted = atoll(argv[0]);
+    if (!knvr_store_open(&store, NULL)) {
+        (void)fprintf(stderr, "kilix-nvr: cannot open the event store\n");
+        return 1;
+    }
+    knvr_query_init(&query);
+    query.limit = 64;
+    if (!knvr_store_events(store, &query, events, 64u, &count)) {
+        knvr_store_close(store);
+        return 1;
+    }
+    for (size_t i = 0u; i < count && i < 64u; i++) {
+        if (events[i].id != wanted) {
+            continue;
+        }
+        /* A clip belonging to the event wins; otherwise the segment that
+         * was recording when it happened. */
+        if (knvr_store_media(store, wanted, media, 8u, &media_count)) {
+            for (size_t m = 0u; m < media_count && m < 8u; m++) {
+                if (strcmp(media[m].kind, "clip") == 0 ||
+                    strcmp(media[m].kind, "segment") == 0) {
+                    target = media[m].path;
+                    break;
+                }
+            }
+        }
+        if (target == NULL &&
+            segment_covering(events[i].camera, events[i].started, segment,
+                             sizeof(segment))) {
+            target = segment;
+        }
+        break;
+    }
+    knvr_store_close(store);
+    if (target == NULL) {
+        (void)fprintf(stderr,
+                      "kilix-nvr: no footage for event %lld\n",
+                      (long long)wanted);
+        return 1;
+    }
+    (void)printf("%s\n", target);
+    return 0;
+}
+
+/*
+ * Cut an event out of the segments it spans, without re-encoding.
+ *
+ * -c copy, so a clip costs I/O and keeps the camera's own bitstream.  The
+ * start is ten seconds before the trigger, which is the pre-roll the
+ * design promised and which needs no buffering because the footage was
+ * already being written.
+ */
+static int command_clip(int argc, char **argv)
+{
+    knvr_store *store = NULL;
+    knvr_query query;
+    knvr_event events[64];
+    size_t count = 0u;
+    int64_t wanted;
+    char segment[KNVR_PATH_MAX];
+    char output[KNVR_PATH_MAX];
+    char clips[KNVR_PATH_MAX];
+    const knvr_event *event = NULL;
+    int status = 1;
+
+    if (argc != 1) {
+        return usage(stderr);
+    }
+    wanted = atoll(argv[0]);
+    if (!knvr_store_open(&store, NULL)) {
+        return 1;
+    }
+    knvr_query_init(&query);
+    query.limit = 64;
+    (void)knvr_store_events(store, &query, events, 64u, &count);
+    for (size_t i = 0u; i < count && i < 64u; i++) {
+        if (events[i].id == wanted) {
+            event = &events[i];
+            break;
+        }
+    }
+    if (event == NULL ||
+        !segment_covering(event->camera, event->started, segment,
+                          sizeof(segment))) {
+        (void)fprintf(stderr, "kilix-nvr: no footage for event %lld\n",
+                      (long long)wanted);
+        knvr_store_close(store);
+        return 1;
+    }
+    if (!knvr_paths_subdir(clips, sizeof(clips), "clips") ||
+        snprintf(output, sizeof(output), "%s/%s-%lld.mkv", clips,
+                 event->camera, (long long)wanted) < 0) {
+        knvr_store_close(store);
+        return 1;
+    }
+    {
+        struct stat info;
+        pid_t child;
+        int wait_status = 0;
+        long offset = 0;
+        char start[32];
+        char duration[32];
+
+        if (stat(segment, &info) == 0) {
+            /* Ten seconds of pre-roll, clamped at the segment's start. */
+            const long into = (long)(event->started - info.st_mtime);
+
+            offset = into > 10 ? into - 10 : 0;
+        }
+        (void)snprintf(start, sizeof(start), "%ld", offset);
+        (void)snprintf(duration, sizeof(duration), "%lld",
+                       (long long)((event->ended > event->started
+                                        ? event->ended - event->started
+                                        : 10) + 10));
+        child = fork();
+        if (child == 0) {
+            (void)execlp("ffmpeg", "ffmpeg", "-hide_banner", "-loglevel",
+                         "error", "-nostdin", "-ss", start, "-i", segment,
+                         "-t", duration, "-c", "copy", "-y", output,
+                         (char *)NULL);
+            _exit(127);
+        }
+        if (child > 0 && waitpid(child, &wait_status, 0) == child &&
+            WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == 0) {
+            (void)knvr_store_add_media(store, wanted, "clip", output);
+            (void)printf("%s\n", output);
+            status = 0;
+        } else {
+            (void)fprintf(stderr, "kilix-nvr: could not cut the clip\n");
+        }
+    }
+    knvr_store_close(store);
+    return status;
+}
+
+/*
+ * Run the detector over an event's stored still again.
+ *
+ * The reason this exists is a better model arriving after the footage
+ * did: re-analysing is how yesterday's events get today's answers,
+ * without keeping the original frames in memory for a day.
+ */
+static int command_reanalyze(int argc, char **argv)
+{
+    knvr_store *store = NULL;
+    knvr_detector *detector = NULL;
+    knvr_detector_options options;
+    knvr_media media[8];
+    knvr_detection_box found[KNVR_DETECT_ROWS];
+    sr_canvas still;
+    size_t media_count = 0u;
+    size_t detections = 0u;
+    int64_t wanted;
+    const char *path = NULL;
+    uint8_t *bgra = NULL;
+    int status = 1;
+
+    if (argc != 1) {
+        return usage(stderr);
+    }
+    wanted = atoll(argv[0]);
+    if (!knvr_store_open(&store, NULL)) {
+        return 1;
+    }
+    if (!knvr_store_media(store, wanted, media, 8u, &media_count)) {
+        knvr_store_close(store);
+        return 1;
+    }
+    for (size_t i = 0u; i < media_count && i < 8u; i++) {
+        if (strcmp(media[i].kind, "still") == 0) {
+            path = media[i].path;
+            break;
+        }
+    }
+    if (path == NULL || !sr_load_ppm(&still, path)) {
+        (void)fprintf(stderr,
+                      "kilix-nvr: event %lld has no still to re-read\n",
+                      (long long)wanted);
+        knvr_store_close(store);
+        return 1;
+    }
+    knvr_detector_options_init(&options);
+    options.width = still.w;
+    options.height = still.h;
+    if (!knvr_detector_start(&detector, &options)) {
+        (void)fprintf(stderr, "kilix-nvr: no detector\n");
+        sr_canvas_free(&still);
+        knvr_store_close(store);
+        return 1;
+    }
+    bgra = malloc((size_t)still.w * (size_t)still.h * 4u);
+    if (bgra != NULL) {
+        for (int i = 0; i < still.w * still.h; i++) {
+            const uint32_t pixel = still.px[i];
+
+            bgra[i * 4 + 0] = (uint8_t)(pixel & 0xFFu);
+            bgra[i * 4 + 1] = (uint8_t)((pixel >> 8) & 0xFFu);
+            bgra[i * 4 + 2] = (uint8_t)((pixel >> 16) & 0xFFu);
+            bgra[i * 4 + 3] = 0xFF;
+        }
+        if (knvr_detector_run(detector, bgra, found, KNVR_DETECT_ROWS,
+                              &detections)) {
+            for (size_t d = 0u; d < detections; d++) {
+                knvr_detection record;
+
+                (void)memset(&record, 0, sizeof(record));
+                record.event = wanted;
+                record.at = (int64_t)time(NULL);
+                (void)snprintf(record.label, sizeof(record.label), "%s",
+                               knvr_detect_label(found[d].class_id));
+                record.score = (double)found[d].score;
+                record.x = found[d].x;
+                record.y = found[d].y;
+                record.w = found[d].w;
+                record.h = found[d].h;
+                (void)knvr_store_add_detection(store, &record);
+                (void)printf("%s %.2f\n", record.label, record.score);
+            }
+            if (detections == 0u) {
+                (void)printf("nothing found\n");
+            }
+            status = 0;
+        }
+        free(bgra);
+    }
+    knvr_detector_stop(detector);
+    sr_canvas_free(&still);
+    knvr_store_close(store);
+    return status;
 }
