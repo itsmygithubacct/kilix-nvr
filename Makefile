@@ -58,12 +58,14 @@ VENDOR_LDLIBS := -lz
 OBJECTS := \
 	$(BUILD_DIR)/knvr_paths.o \
 	$(BUILD_DIR)/knvr_config.o \
+	$(BUILD_DIR)/knvr_store.o \
 	$(BUILD_DIR)/knvr_watch.o
 
 STATIC_LIB := $(BUILD_DIR)/lib$(PROJECT).a
 COMMAND := $(BUILD_DIR)/$(PROJECT)
 
-TESTS := $(BUILD_DIR)/test-config $(BUILD_DIR)/test-watch
+TESTS := $(BUILD_DIR)/test-config $(BUILD_DIR)/test-store \
+	$(BUILD_DIR)/test-watch
 
 .DEFAULT_GOAL := all
 .PHONY: all test sanitize install clean
