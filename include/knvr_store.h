@@ -130,6 +130,17 @@ bool knvr_store_events(
     const knvr_store *store, const knvr_query *query, knvr_event *out,
     size_t capacity, size_t *count);
 
+typedef struct knvr_media {
+    char kind[KNVR_STORE_LABEL_MAX];
+    char path[KNVR_STORE_PATH_MAX];
+    int64_t bytes;
+} knvr_media;
+
+/* The files belonging to an event, for review and for playback. */
+bool knvr_store_media(
+    const knvr_store *store, int64_t event_id, knvr_media *out,
+    size_t capacity, size_t *count);
+
 bool knvr_store_detections(
     const knvr_store *store, int64_t event_id, knvr_detection *out,
     size_t capacity, size_t *count);

@@ -59,6 +59,7 @@ OBJECTS := \
 	$(BUILD_DIR)/knvr_paths.o \
 	$(BUILD_DIR)/knvr_config.o \
 	$(BUILD_DIR)/knvr_detect.o \
+	$(BUILD_DIR)/knvr_review.o \
 	$(BUILD_DIR)/knvr_store.o \
 	$(BUILD_DIR)/knvr_watch.o
 

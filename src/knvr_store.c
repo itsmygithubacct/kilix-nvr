@@ -463,6 +463,48 @@ bool knvr_store_detections(
     return true;
 }
 
+bool knvr_store_media(
+    const knvr_store *store, int64_t event_id, knvr_media *out,
+    size_t capacity, size_t *count)
+{
+    knvr_store *mutable_store = (knvr_store *)store;
+    sqlite3_stmt *statement = NULL;
+    size_t total = 0u;
+
+    if (count != NULL) {
+        *count = 0u;
+    }
+    if (store == NULL) {
+        return false;
+    }
+    if (sqlite3_prepare_v2(
+            store->db,
+            "SELECT kind, path, bytes FROM media WHERE event = ?1;",
+            -1, &statement, NULL) != SQLITE_OK) {
+        return fail_sqlite(mutable_store, "cannot read media");
+    }
+    (void)sqlite3_bind_int64(statement, 1, event_id);
+    while (sqlite3_step(statement) == SQLITE_ROW) {
+        if (out != NULL && total < capacity) {
+            const unsigned char *kind = sqlite3_column_text(statement, 0);
+            const unsigned char *path = sqlite3_column_text(statement, 1);
+
+            (void)memset(&out[total], 0, sizeof(out[total]));
+            (void)snprintf(out[total].kind, sizeof(out[total].kind), "%s",
+                           kind != NULL ? (const char *)kind : "");
+            (void)snprintf(out[total].path, sizeof(out[total].path), "%s",
+                           path != NULL ? (const char *)path : "");
+            out[total].bytes = sqlite3_column_int64(statement, 2);
+        }
+        total++;
+    }
+    sqlite3_finalize(statement);
+    if (count != NULL) {
+        *count = total;
+    }
+    return true;
+}
+
 /* ------------------------------- retention ------------------------------ */
 
 /*
