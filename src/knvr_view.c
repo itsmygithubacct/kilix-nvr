@@ -27,11 +27,13 @@
 #include "kitty_terminal_session.h"
 #include "soft_raster.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -73,6 +75,37 @@ typedef struct feed {
     bool online;
 } feed;
 
+/*
+ * Replay: a recording opened at a moment.
+ *
+ * The same krtsp_source everything else here uses, pointed at a segment
+ * instead of a camera and told where to start.  Boxes come from the
+ * store rather than from re-running a model: they are what the recorder
+ * actually decided, and re-detecting on replay would show the archive
+ * something it never saw.  `reanalyze` stays the deliberate exception.
+ */
+typedef struct replay {
+    bool active;
+    char camera[KNVR_NAME_MAX];
+    char segment[KNVR_PATH_MAX];
+    krtsp_source *source;
+    uint8_t *frame;
+    uint64_t seen;
+    int64_t started;         /* wall time of the segment's first frame */
+    int64_t at;              /* wall time of the frame on screen */
+    int64_t event_at;        /* the moment being replayed */
+    int offset;              /* seconds into the segment */
+    bool fast;
+    bool paused;
+    bool ended;
+    knvr_detection marks[64];
+    size_t mark_count;
+    float day[720];          /* the day's motion, one bucket per column */
+    float day_audio[720];
+    int64_t day_from;
+    int64_t day_to;
+} replay;
+
 typedef struct view {
     feed feeds[FEED_MAX];
     size_t count;
@@ -84,6 +117,7 @@ typedef struct view {
     size_t event_picked;
     time_t events_read;
     bool detect;
+    replay back;
 } view;
 
 /* ------------------------------- the feeds ------------------------------- */
@@ -326,6 +360,229 @@ static bool feed_step(feed *at, knvr_store *store)
     return true;
 }
 
+/* -------------------------------- replay --------------------------------- */
+
+/*
+ * The segment covering a moment, and when that segment starts.
+ *
+ * Segments are named by the clock and the filesystem is authoritative, so
+ * this reads the directory rather than an index: the segmenter writes
+ * files without telling anyone, and an index that can disagree with the
+ * disk is worse than no index.  mtime is when the segment was closed, so
+ * its start is that less its duration - measured, not assumed, because a
+ * segment cut short by a restart is shorter than the setting.
+ */
+static bool segment_at(const char *camera, int64_t when, char *out,
+                       size_t size, int64_t *starts)
+{
+    char segments[KNVR_PATH_MAX];
+    char directory[KNVR_PATH_MAX];
+    DIR *handle;
+    struct dirent *entry;
+    time_t best = 0;
+    bool found = false;
+
+    if (!knvr_paths_subdir(segments, sizeof(segments), "segments")) {
+        return false;
+    }
+    if (snprintf(directory, sizeof(directory), "%s/%s", segments, camera) < 0) {
+        return false;
+    }
+    handle = opendir(directory);
+    if (handle == NULL) {
+        return false;
+    }
+    while ((entry = readdir(handle)) != NULL) {
+        char candidate[KNVR_PATH_MAX];
+        struct stat info;
+
+        if (entry->d_name[0] == '.') {
+            continue;
+        }
+        if (snprintf(candidate, sizeof(candidate), "%s/%s", directory,
+                     entry->d_name) < 0) {
+            continue;
+        }
+        if (stat(candidate, &info) != 0 || !S_ISREG(info.st_mode)) {
+            continue;
+        }
+        if (info.st_mtime <= (time_t)when + 90 && info.st_mtime > best) {
+            best = info.st_mtime;
+            (void)snprintf(out, size, "%s", candidate);
+            found = true;
+        }
+    }
+    (void)closedir(handle);
+    if (found && starts != NULL) {
+        /* A segment is a minute by default; its start is its close less
+         * that.  Approximate, and the strip cursor is honest about it. */
+        *starts = (int64_t)best - 60;
+    }
+    return found;
+}
+
+static void replay_stop(replay *back)
+{
+    krtsp_source_stop(back->source);
+    free(back->frame);
+    back->source = NULL;
+    back->frame = NULL;
+    back->active = false;
+    back->ended = false;
+}
+
+static void replay_open(view *state, const knvr_event *event)
+{
+    replay *back = &state->back;
+    krtsp_source_options options;
+    char log_path[KNVR_PATH_MAX];
+    int64_t starts = 0;
+    struct tm parts;
+    time_t midnight;
+
+    replay_stop(back);
+    if (event == NULL) {
+        return;
+    }
+    (void)snprintf(back->camera, sizeof(back->camera), "%.*s",
+                   (int)sizeof(back->camera) - 1, event->camera);
+    back->event_at = event->started;
+    back->at = event->started;
+    if (!segment_at(event->camera, event->started, back->segment,
+                    sizeof(back->segment), &starts)) {
+        /* Said rather than silently doing nothing: "there is no footage"
+         * is the answer, and a camera on stills has none by design.  The
+         * day still draws - the pulse is kept whether or not anything was
+         * recorded, and skimming an empty night is most of the point. */
+        back->segment[0] = '\0';
+        back->active = true;
+        back->ended = true;
+        starts = event->started;
+    }
+    back->started = starts;
+    /* Ten seconds of pre-roll, which costs nothing: the footage before
+     * the trigger was already being written. */
+    back->offset = (int)(event->started - starts) - 10;
+    if (back->offset < 0) {
+        back->offset = 0;
+    }
+    back->at = starts + back->offset;
+
+    if (back->segment[0] == '\0') {
+        /* No footage, but the day and the marks still load below. */
+        goto day;
+    }
+    krtsp_source_options_init(&options);
+    options.pixfmt = KRTSP_PIXFMT_BGRA;
+    options.width = DECODE_W;
+    options.height = DECODE_H;
+    options.letterbox = true;
+    options.realtime = !back->fast;
+    options.seek_seconds = back->offset;
+    if (knvr_paths_state_file(log_path, sizeof(log_path), "ffmpeg.log")) {
+        options.log_path = log_path;
+    }
+    back->frame = malloc((size_t)DECODE_W * (size_t)DECODE_H * 4u);
+    if (back->frame == NULL ||
+        !krtsp_source_start(&back->source, back->segment, &options)) {
+        replay_stop(back);
+        return;
+    }
+    back->seen = 0u;
+    back->active = true;
+    back->paused = false;
+day:
+    back->mark_count = 0u;
+    (void)knvr_store_detections(state->store, event->id, back->marks, 64u,
+                                &back->mark_count);
+    if (back->mark_count > 64u) {
+        back->mark_count = 64u;
+    }
+    /* The day the event is in, for the scrubber. */
+    midnight = (time_t)event->started;
+    if (localtime_r(&midnight, &parts) != NULL) {
+        parts.tm_hour = 0;
+        parts.tm_min = 0;
+        parts.tm_sec = 0;
+        back->day_from = (int64_t)mktime(&parts);
+        back->day_to = back->day_from + 86400;
+    } else {
+        back->day_from = event->started - 43200;
+        back->day_to = back->day_from + 86400;
+    }
+    {
+        knvr_pulse day[720];
+
+        if (knvr_store_pulse_series(state->store, event->camera,
+                                    back->day_from, back->day_to, day,
+                                    720u)) {
+            for (size_t i = 0u; i < 720u; i++) {
+                back->day[i] = day[i].motion;
+                back->day_audio[i] = day[i].audio;
+            }
+        }
+    }
+}
+
+static void replay_step(replay *back)
+{
+    krtsp_source_stats stats;
+    const uint8_t *pixels;
+    int age_ms = 0;
+
+    if (!back->active || back->source == NULL || back->paused) {
+        return;
+    }
+    krtsp_source_get_stats(back->source, &stats);
+    if (stats.frames == back->seen) {
+        /* A recording that has stopped producing frames has ended - which
+         * for a file is the ordinary way it finishes, not a fault. */
+        if (krtsp_source_status(back->source) == KRTSP_FAILED) {
+            back->ended = true;
+        }
+        return;
+    }
+    pixels = krtsp_source_borrow(back->source, &age_ms);
+    if (pixels == NULL) {
+        return;
+    }
+    back->seen = stats.frames;
+    (void)memcpy(back->frame, pixels,
+                 (size_t)DECODE_W * (size_t)DECODE_H * 4u);
+    krtsp_source_release(back->source);
+    /* Wall time from the frame count and the source rate is guesswork; the
+     * honest clock here is the segment's own start plus how long we have
+     * been playing it. */
+    back->at = back->started + back->offset +
+               (int64_t)(back->seen / (back->fast ? 60u : 20u));
+
+    {
+        /* The boxes the recorder wrote for this second.  Drawn from the
+         * store rather than re-detected: this is what it decided at the
+         * time, and a different answer now would be a different archive. */
+        kod_box shown[KOD_BOX_MAX];
+        size_t count = 0u;
+
+        for (size_t i = 0u; i < back->mark_count && count < KOD_BOX_MAX;
+             i++) {
+            const knvr_detection *mark = &back->marks[i];
+
+            if (mark->at < back->at - 1 || mark->at > back->at + 1) {
+                continue;
+            }
+            shown[count].class_id = kod_class_from_name(mark->label);
+            shown[count].score = (float)mark->score;
+            shown[count].at.x = mark->x;
+            shown[count].at.y = mark->y;
+            shown[count].at.w = mark->w;
+            shown[count].at.h = mark->h;
+            shown[count].region = -1;
+            count++;
+        }
+        kod_draw_boxes(back->frame, DECODE_W, DECODE_H, shown, count);
+    }
+}
+
 /* -------------------------------- drawing -------------------------------- */
 
 static void draw_labels(sr_canvas *canvas, const feed *at, int x, int y,
@@ -488,8 +745,93 @@ static void refresh_events(view *state)
     }
 }
 
+static void compose_replay(sr_canvas *canvas, view *state)
+{
+    replay *back = &state->back;
+    const int width = canvas->w;
+    const int height = canvas->h;
+    const int list_width = width / 4 < 280 ? 280 : width / 4;
+    const int stage_w = width - list_width - 16;
+    const int picture_h = height - 40 - 2 * STRIP_H - 30;
+    char line[256];
+    struct tm parts;
+    char stamp[32] = "?";
+    knvr_strip strip;
+    const time_t at = (time_t)back->at;
+
+    sr_clear(canvas, BACKDROP);
+    sr_fill_rect(canvas, 0.0f, 0.0f, (float)width, 26.0f, PANEL, 1.0f);
+    if (localtime_r(&at, &parts) != NULL) {
+        (void)strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &parts);
+    }
+    (void)snprintf(line, sizeof(line), "%s   %s   %s%s", back->camera, stamp,
+                   back->paused ? "paused" : (back->fast ? "x4" : "x1"),
+                   back->ended ? "   end" : "");
+    sr_text(canvas, 8.0f, 7.0f, line, TEXT, 1.0f, 1);
+    sr_text(canvas,
+            (float)(width - 8 -
+                    sr_text_width_in(SR_FONT_FIXED_8X16,
+                                     "space pause  f fast  l live  q quit",
+                                     1)),
+            7.0f, "space pause  f fast  l live  q quit", DIM, 1.0f, 1);
+
+    if (back->frame != NULL) {
+        sr_canvas picture;
+        const float sx = (float)stage_w / (float)DECODE_W;
+        const float sy = (float)picture_h / (float)DECODE_H;
+        const float scale = sx < sy ? sx : sy;
+
+        sr_canvas_wrap(&picture, (uint32_t *)(void *)(uintptr_t)back->frame,
+                       DECODE_W, DECODE_H);
+        sr_blit_scaled(canvas, &picture, 8, 32,
+                       (int)((float)DECODE_W * scale),
+                       (int)((float)DECODE_H * scale), 1.0f);
+    } else {
+        sr_fill_rect(canvas, 8.0f, 32.0f, (float)stage_w, (float)picture_h,
+                     PANEL, 1.0f);
+        sr_text(canvas, 16.0f, (float)(32 + picture_h / 2),
+                back->segment[0] == '\0'
+                    ? "no footage for this event - the camera was not recording"
+                    : "opening the recording",
+                DIM, 1.0f, 1);
+    }
+
+    /* The day, and where in it this is.  The strip is how an empty night
+     * gets skimmed; the list of events cannot do that. */
+    (void)memset(&strip, 0, sizeof(strip));
+    strip.label = "motion";
+    strip.samples = back->day;
+    strip.count = 720u;
+    strip.colour = MOTION_COLOUR;
+    strip.threshold = -1.0f;
+    strip.cursor = -1.0f;
+    if (back->day_to > back->day_from) {
+        strip.cursor = (float)((back->at - back->day_from) * 720 /
+                               (back->day_to - back->day_from));
+    }
+    knvr_strip_draw(canvas, &strip, 8, 32 + picture_h + 8, stage_w, STRIP_H);
+    strip.label = "sound";
+    strip.samples = back->day_audio;
+    strip.colour = SOUND_COLOUR;
+    strip.threshold = 0.5f;
+    knvr_strip_draw(canvas, &strip, 8, 32 + picture_h + 8 + STRIP_H, stage_w,
+                    STRIP_H);
+    sr_text(canvas, 72.0f, (float)(32 + picture_h + 12 + 2 * STRIP_H),
+            "00:00", DIM, 1.0f, 1);
+    sr_text(canvas, (float)(stage_w - 40),
+            (float)(32 + picture_h + 12 + 2 * STRIP_H), "24:00", DIM, 1.0f,
+            1);
+
+    draw_events(canvas, state, width - list_width, 32, list_width - 8,
+                height - 40);
+}
+
 static void compose(sr_canvas *canvas, view *state)
 {
+    if (state->back.active) {
+        compose_replay(canvas, state);
+        return;
+    }
     char line[256];
     const int width = canvas->w;
     const int height = canvas->h;
@@ -660,6 +1002,20 @@ int knvr_view(
             running = false;
         }
     }
+    if (options->replay) {
+        refresh_events(&state);
+        for (size_t i = 0u; i < state.event_count; i++) {
+            /* The newest event on the camera that was asked for, rather
+             * than the newest anywhere: `view gazebo --replay` meaning
+             * "the drive camera's last event" would be a surprise. */
+            if (options->camera == NULL ||
+                strcmp(state.events[i].camera, options->camera) == 0) {
+                state.event_picked = i;
+                replay_open(&state, &state.events[i]);
+                break;
+            }
+        }
+    }
     deadline = options->seconds > 0 ? time(NULL) + options->seconds : 0;
 
     while (running) {
@@ -670,9 +1026,14 @@ int knvr_view(
         if (deadline > 0 && time(NULL) >= deadline) {
             break;
         }
-        for (size_t i = 0u; i < state.count; i++) {
-            if (feed_step(&state.feeds[i], store)) {
-                fresh = true;
+        if (state.back.active) {
+            replay_step(&state.back);
+            fresh = true;
+        } else {
+            for (size_t i = 0u; i < state.count; i++) {
+                if (feed_step(&state.feeds[i], store)) {
+                    fresh = true;
+                }
             }
         }
         refresh_events(&state);
@@ -740,6 +1101,31 @@ int knvr_view(
             } else if (key.key == 'd') {
                 state.detect = !state.detect;
                 feed_detector(&state.feeds[state.focus], state.detect);
+            } else if (key.key == '\r' || key.key == 'r') {
+                /* Into the recording at the moment that was picked.  The
+                 * live feeds keep running behind it: coming back out
+                 * should not mean waiting for three cameras to reconnect. */
+                if (state.event_count > 0u) {
+                    replay_open(&state, &state.events[state.event_picked]);
+                }
+            } else if (key.key == 'l') {
+                replay_stop(&state.back);
+            } else if (key.key == ' ') {
+                state.back.paused = !state.back.paused;
+            } else if (key.key == 'f') {
+                state.back.fast = !state.back.fast;
+                if (state.back.active && state.back.segment[0] != '\0') {
+                    /* Speed is how fast ffmpeg is told to read, so it
+                     * takes a restart at the moment on screen. */
+                    knvr_event resume;
+
+                    (void)memset(&resume, 0, sizeof(resume));
+                    (void)snprintf(resume.camera, sizeof(resume.camera),
+                                   "%.*s", (int)sizeof(resume.camera) - 1,
+                                   state.back.camera);
+                    resume.started = state.back.at;
+                    replay_open(&state, &resume);
+                }
             } else if (key.key == KITTYKB_KEY_DOWN) {
                 if (state.event_picked + 1u < state.event_count) {
                     state.event_picked++;
@@ -753,6 +1139,7 @@ int knvr_view(
         }
     }
 
+    replay_stop(&state.back);
     for (size_t i = 0u; i < state.count; i++) {
         feed_stop(&state.feeds[i]);
     }
