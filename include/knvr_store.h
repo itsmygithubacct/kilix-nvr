@@ -195,6 +195,48 @@ bool knvr_store_detections(
     const knvr_store *store, int64_t event_id, knvr_detection *out,
     size_t capacity, size_t *count);
 
+/* -------------------------------- the pulse ------------------------------ */
+
+/*
+ * How much a camera was moving and how loud it was, once a second.
+ *
+ * Both numbers already exist on every frame - kmd_result.motion_fraction
+ * and ksd_level() - and both were thrown away.  Kept, they turn a camera
+ * into something you can read at a glance over an hour: a bark with
+ * nothing moving is a different fact from a bark with a shape at the
+ * gate, and no list of events shows that.
+ *
+ * Peak rather than mean, deliberately: a loud instant in a quiet second
+ * is the thing worth seeing, and averaging is how it disappears.
+ */
+typedef struct knvr_pulse {
+    int64_t at;      /* Unix seconds, UTC */
+    float motion;    /* 0..1, the second's peak */
+    float audio;     /* 0..1, the second's peak */
+} knvr_pulse;
+
+/*
+ * Record one second.  Calling it repeatedly within the same second keeps
+ * the larger value, so a caller can hand over every frame without
+ * tracking which second it is in.
+ */
+bool knvr_store_pulse(
+    knvr_store *store, const char *camera, int64_t at, float motion,
+    float audio);
+
+/*
+ * The series between two times, resampled into `count` buckets.
+ *
+ * Resampled here rather than in the drawing, because the width of a
+ * strip in pixels is what decides how many buckets there are, and a
+ * caller asking for a day at 900 pixels wants 900 numbers rather than
+ * 86,400.  Empty buckets read as zero, which is the truth: nothing was
+ * recorded then.
+ */
+bool knvr_store_pulse_series(
+    const knvr_store *store, const char *camera, int64_t from, int64_t to,
+    knvr_pulse *out, size_t count);
+
 /* ------------------------------- retention ------------------------------ */
 
 typedef struct knvr_retention {

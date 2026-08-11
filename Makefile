@@ -72,7 +72,9 @@ OBJECTS := \
 	$(BUILD_DIR)/knvr_review.o \
 	$(BUILD_DIR)/knvr_sqlite.o \
 	$(BUILD_DIR)/knvr_store.o \
+	$(BUILD_DIR)/knvr_strip.o \
 	$(BUILD_DIR)/knvr_track.o \
+	$(BUILD_DIR)/knvr_view.o \
 	$(BUILD_DIR)/knvr_watch.o \
 	$(BUILD_DIR)/knvr_zone.o
 

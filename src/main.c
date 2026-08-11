@@ -11,6 +11,7 @@
 #include "knvr_detect.h"
 #include "knvr_paths.h"
 #include "knvr_review.h"
+#include "knvr_view.h"
 #include "kilix_sound_detect.h"
 #include "knvr_track.h"
 #include "knvr_zone.h"
@@ -49,6 +50,9 @@ static int usage(FILE *stream)
         "  zone add <name> <zone> [inertia=N] [preclusive=yes] [loiter=S]\n"
         "  zone remove <name> <zone>\n"
         "  zone paint <name>       grab a frame and paint its zones\n"
+        "  view [name]             watch the cameras: the picture, what the\n"
+        "                          models make of it, and motion and sound\n"
+        "                          drawn as waveforms under each one\n"
         "  review                  browse events with the frame that caused\n"
         "                          them; up/down to select, q to quit\n"
         "  play <event>            print the footage covering an event\n"
@@ -376,6 +380,32 @@ int main(int argc, char **argv)
         status = command_watch(config, argc - 2, argv + 2);
     } else if (strcmp(command, "events") == 0) {
         status = command_events(argc - 2, argv + 2);
+    } else if (strcmp(command, "view") == 0) {
+        knvr_store *store = NULL;
+        knvr_view_options view_options;
+
+        knvr_view_options_init(&view_options);
+        for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--render") == 0 && i + 1 < argc) {
+                view_options.render = argv[++i];
+            } else if (strcmp(argv[i], "--seconds") == 0 && i + 1 < argc) {
+                view_options.seconds = atoi(argv[++i]);
+            } else if (strcmp(argv[i], "--no-detect") == 0) {
+                view_options.detect = false;
+            } else if (argv[i][0] != '-') {
+                view_options.camera = argv[i];
+            } else {
+                knvr_config_close(config);
+                return usage(stderr);
+            }
+        }
+        if (!knvr_store_open(&store, NULL)) {
+            (void)fprintf(stderr, "kilix-nvr: cannot open the event store\n");
+            status = 1;
+        } else {
+            status = knvr_view(config, store, &view_options);
+            knvr_store_close(store);
+        }
     } else if (strcmp(command, "review") == 0) {
         knvr_store *store = NULL;
 
