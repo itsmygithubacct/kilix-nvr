@@ -192,14 +192,14 @@ the host rather than of a camera:
 
 ```sh
 KILIX_NVR_DETECT="ssh gpubox kilix-nvr-detect"
-KILIX_NVR_LISTEN="$HOME/.local/gpu_terminal/kilix-nvr/venv/bin/python \
-                  /usr/local/bin/kilix-nvr-listen"
+KILIX_SOUND_CLASSIFIER="$HOME/.venvs/audio/bin/python \
+                        /usr/local/bin/kilix-listen-classify"
 ```
 
-Unset, each falls back to `kilix-nvr-detect` and `kilix-nvr-listen` on `PATH`,
-which `make install` puts there beside the binary. Both are split on spaces
-with no quoting: a path containing a space needs a wrapper script, which is a
-smaller surprise than half-implemented shell quoting.
+Unset, each falls back to the bundled tool — beside the binary if `make
+install` put it there, else in the checkout's `tools/`, else on `PATH`. Both
+are split on spaces with no quoting: a path containing a space needs a wrapper
+script, which is a smaller surprise than half-implemented shell quoting.
 
 ## Configuration and data
 

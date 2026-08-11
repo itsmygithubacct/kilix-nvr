@@ -22,6 +22,7 @@ LDLIBS += -lsqlite3 -lpthread -lm
 RTSP := third_party/kilix-rtsp
 MOTION := third_party/kilix-motion-detect
 MASK := third_party/kilix-mask
+KSD := third_party/kilix-sound-detect
 KTS := $(RTSP)/third_party/kitty-terminal-session
 KFB := $(KTS)/third_party/kitty-framebuffer
 KIN := $(KTS)/third_party/kitty-input
@@ -30,6 +31,7 @@ SR := $(RTSP)/third_party/soft-raster
 
 MODULE_CPPFLAGS := \
 	-I$(RTSP)/include -I$(MOTION)/include -I$(MASK)/include \
+	-I$(KSD)/include \
 	-I$(KTS)/include -I$(KFB)/include -I$(KIN)/include -I$(KKB)/include \
 	-I$(SR)/include
 
@@ -44,6 +46,7 @@ VENDOR_SOURCES := \
 	$(RTSP)/src/krtsp_exec.c \
 	$(MOTION)/src/kilix_motion_detect.c \
 	$(MASK)/src/kilix_mask.c \
+	$(KSD)/src/kilix_sound_detect.c \
 	$(KTS)/src/kitty_terminal_session.c \
 	$(KFB)/src/kitty_framebuffer.c \
 	$(KIN)/src/kitty_input.c \
@@ -61,7 +64,6 @@ OBJECTS := \
 	$(BUILD_DIR)/knvr_config.o \
 	$(BUILD_DIR)/knvr_detect.o \
 	$(BUILD_DIR)/knvr_review.o \
-	$(BUILD_DIR)/knvr_sound.o \
 	$(BUILD_DIR)/knvr_sqlite.o \
 	$(BUILD_DIR)/knvr_store.o \
 	$(BUILD_DIR)/knvr_track.o \
@@ -72,9 +74,8 @@ STATIC_LIB := $(BUILD_DIR)/lib$(PROJECT).a
 COMMAND := $(BUILD_DIR)/$(PROJECT)
 
 TESTS := $(BUILD_DIR)/test-config $(BUILD_DIR)/test-detect \
-	$(BUILD_DIR)/test-sound $(BUILD_DIR)/test-store \
-	$(BUILD_DIR)/test-track $(BUILD_DIR)/test-watch \
-	$(BUILD_DIR)/test-zone
+	$(BUILD_DIR)/test-store $(BUILD_DIR)/test-track \
+	$(BUILD_DIR)/test-watch $(BUILD_DIR)/test-zone
 
 .DEFAULT_GOAL := all
 .PHONY: all test sanitize install clean
@@ -124,16 +125,19 @@ sanitize: LDFLAGS += -fsanitize=address,undefined
 sanitize: clean
 	@$(MAKE) --no-print-directory CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" test
 
-# The detector, the listener and the model fetcher go with the binary:
-# knvr_detect and knvr_sound spawn them by name off PATH, so a command
-# installed without them is a recorder that silently never detects.
-TOOLS := tools/kilix-nvr-detect tools/kilix-nvr-listen \
-	tools/kilix-nvr-fetch-model
+# The detector goes with the binary: knvr_detect spawns it by name, so a
+# command installed without it is a recorder that silently never detects.
+# The sound side's tools belong to kilix-sound-detect and are installed by
+# it, because two copies of a classifier is two things to keep in step.
+TOOLS := tools/kilix-nvr-detect
+KSD_TOOLS := $(KSD)/tools/kilix-listen-classify \
+	$(KSD)/tools/kilix-sound-fetch-model
 
 install: all
 	$(INSTALL) -d $(DESTDIR)$(PREFIX)/bin
 	$(INSTALL) -m 755 $(COMMAND) $(DESTDIR)$(PREFIX)/bin/
 	$(INSTALL) -m 755 $(TOOLS) $(DESTDIR)$(PREFIX)/bin/
+	$(INSTALL) -m 755 $(KSD_TOOLS) $(DESTDIR)$(PREFIX)/bin/
 
 clean:
 	rm -rf $(BUILD_DIR)

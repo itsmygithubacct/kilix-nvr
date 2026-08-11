@@ -11,7 +11,7 @@
 #include "knvr_detect.h"
 #include "knvr_paths.h"
 #include "knvr_review.h"
-#include "knvr_sound.h"
+#include "kilix_sound_detect.h"
 #include "knvr_track.h"
 #include "knvr_zone.h"
 
@@ -532,7 +532,7 @@ static int command_watch(knvr_config *config, int argc, char **argv)
     knvr_watch_options options;
     knvr_store *store = NULL;
     knvr_detector *detector = NULL;
-    knvr_sound *sound = NULL;
+    ksd_listener *sound = NULL;
     knvr_tracker *tracker = NULL;
     knvr_zones *zones = NULL;
     knvr_watch *watch = NULL;
@@ -664,10 +664,10 @@ static int command_watch(knvr_config *config, int argc, char **argv)
 
 
     if (camera.sound_events) {
-        knvr_sound_options sound_options;
+        ksd_options sound_options;
         static char sound_url[KRTSP_URL_MAX];
 
-        knvr_sound_options_init(&sound_options);
+        ksd_options_init(&sound_options);
         /* Its own log.  Two ffmpegs sharing one file makes "which of them
          * is complaining" a guess, and the audio one complains loudly on
          * a camera that carries no audio at all. */
@@ -678,7 +678,7 @@ static int command_watch(knvr_config *config, int argc, char **argv)
         /* The main stream, which is where the audio is: substreams
          * frequently carry none at all. */
         if (resolve_url(name, false, sound_url, sizeof(sound_url)) &&
-            !knvr_sound_start(&sound, sound_url, &sound_options)) {
+            !ksd_open(&sound, sound_url, &sound_options)) {
             (void)fprintf(stderr,
                           "kilix-nvr: %s: no listener; sight only\n", name);
         }
@@ -913,10 +913,10 @@ static int command_watch(knvr_config *config, int argc, char **argv)
             event_id = 0;
         }
         if (sound != NULL) {
-            knvr_sound_event heard[8];
+            ksd_event heard[8];
             size_t heard_count = 0u;
 
-            if (knvr_sound_step(sound, heard, 8u, &heard_count)) {
+            if (ksd_step(sound, heard, 8u, &heard_count)) {
                 for (size_t h = 0u; h < heard_count; h++) {
                     knvr_detection record;
                     int64_t sound_event = event_id;
@@ -936,19 +936,19 @@ static int command_watch(knvr_config *config, int argc, char **argv)
                     record.event = sound_event;
                     record.at = (int64_t)time(NULL);
                     (void)snprintf(record.label, sizeof(record.label), "%s",
-                                   knvr_sound_label(heard[h].class_id));
+                                   ksd_label(heard[h].class_id));
                     record.score = (double)heard[h].score;
                     (void)knvr_store_add_detection(store, &record);
                     (void)printf("    heard %s %.2f\n", record.label,
                                  record.score);
                 }
-            } else if (knvr_sound_error(sound) != NULL) {
+            } else if (ksd_error(sound) != NULL) {
                 /* Once, then sight-only.  A camera with no audio stream
                  * at all reaches here immediately, and repeating it every
                  * second would bury everything else. */
                 (void)fprintf(stderr, "kilix-nvr: %s: %s; sight only\n",
-                              name, knvr_sound_error(sound));
-                knvr_sound_stop(sound);
+                              name, ksd_error(sound));
+                ksd_close(sound);
                 sound = NULL;
             }
         }
@@ -978,7 +978,7 @@ static int command_watch(knvr_config *config, int argc, char **argv)
     }
     knvr_watch_stop(watch);
     knvr_detector_stop(detector);
-    knvr_sound_stop(sound);
+    ksd_close(sound);
     knvr_tracker_free(tracker);
     knvr_zones_free(zones);
     knvr_store_close(store);
