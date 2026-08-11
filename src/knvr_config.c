@@ -13,6 +13,7 @@
 
 #include "knvr_config.h"
 #include "knvr_paths.h"
+#include "knvr_sqlite.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -69,8 +70,17 @@ static const char SCHEMA[] =
     "  audio INTEGER NOT NULL DEFAULT 0,"
     "  sound_events INTEGER NOT NULL DEFAULT 0,"
     "  retain_days INTEGER NOT NULL DEFAULT 0,"
-    "  mask TEXT NOT NULL DEFAULT ''"
+    "  mask TEXT NOT NULL DEFAULT '',"
+    "  zones TEXT NOT NULL DEFAULT ''"
     ");";
+
+/* Added after the first release, so it has to reach databases that
+ * already describe five cameras. */
+static bool migrate(sqlite3 *db)
+{
+    return knvr_sqlite_add_column(db, "camera", "zones",
+                                  "TEXT NOT NULL DEFAULT ''");
+}
 
 bool knvr_config_open(knvr_config **out, const char *path)
 {
@@ -105,6 +115,13 @@ bool knvr_config_open(knvr_config **out, const char *path)
                        "cannot prepare the policy store: %s",
                        message != NULL ? message : "unknown");
         sqlite3_free(message);
+        sqlite3_close(config->db);
+        free(config);
+        return false;
+    }
+    if (!migrate(config->db)) {
+        (void)snprintf(config->error, sizeof(config->error),
+                       "cannot bring the policy store up to date");
         sqlite3_close(config->db);
         free(config);
         return false;
@@ -204,6 +221,7 @@ static void read_row(sqlite3_stmt *statement, knvr_camera *out)
 {
     const unsigned char *name = sqlite3_column_text(statement, 0);
     const unsigned char *mask = sqlite3_column_text(statement, 7);
+    const unsigned char *zones = sqlite3_column_text(statement, 8);
 
     (void)memset(out, 0, sizeof(*out));
     (void)snprintf(out->name, sizeof(out->name), "%s",
@@ -216,11 +234,13 @@ static void read_row(sqlite3_stmt *statement, knvr_camera *out)
     out->retain_days = sqlite3_column_int(statement, 6);
     (void)snprintf(out->mask, sizeof(out->mask), "%s",
                    mask != NULL ? (const char *)mask : "");
+    (void)snprintf(out->zones, sizeof(out->zones), "%s",
+                   zones != NULL ? (const char *)zones : "");
 }
 
 static const char SELECT_COLUMNS[] =
     "SELECT name, record, detect, motion, audio, sound_events, retain_days, "
-    "mask FROM camera";
+    "mask, zones FROM camera";
 
 bool knvr_config_get(
     const knvr_config *config, const char *name, knvr_camera *out)
@@ -259,8 +279,8 @@ bool knvr_config_put(knvr_config *config, const knvr_camera *camera)
     if (sqlite3_prepare_v2(
             config->db,
             "UPDATE camera SET record = ?2, detect = ?3, motion = ?4, "
-            "audio = ?5, sound_events = ?6, retain_days = ?7, mask = ?8 "
-            "WHERE name = ?1;",
+            "audio = ?5, sound_events = ?6, retain_days = ?7, mask = ?8, "
+            "zones = ?9 WHERE name = ?1;",
             -1, &statement, NULL) != SQLITE_OK) {
         return fail_sqlite(config, "cannot write");
     }
@@ -272,6 +292,8 @@ bool knvr_config_put(knvr_config *config, const knvr_camera *camera)
     (void)sqlite3_bind_int(statement, 6, camera->sound_events ? 1 : 0);
     (void)sqlite3_bind_int(statement, 7, camera->retain_days);
     (void)sqlite3_bind_text(statement, 8, camera->mask, -1, SQLITE_TRANSIENT);
+    (void)sqlite3_bind_text(statement, 9, camera->zones, -1,
+                            SQLITE_TRANSIENT);
     status = sqlite3_step(statement);
     sqlite3_finalize(statement);
     if (status != SQLITE_DONE) {
@@ -468,6 +490,16 @@ bool knvr_camera_set(
             return false;
         }
         (void)snprintf(camera->mask, sizeof(camera->mask), "%s", value);
+        return true;
+    }
+    if (strcmp(key, "zones") == 0) {
+        if (strlen(value) >= sizeof(camera->zones)) {
+            if (reason != NULL) {
+                *reason = "that zone map path is too long";
+            }
+            return false;
+        }
+        (void)snprintf(camera->zones, sizeof(camera->zones), "%s", value);
         return true;
     }
     if (reason != NULL) {

@@ -9,6 +9,7 @@
 
 #include "knvr_store.h"
 #include "knvr_paths.h"
+#include "knvr_sqlite.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,7 +70,9 @@ static const char SCHEMA[] =
     "  label TEXT NOT NULL,"
     "  score REAL NOT NULL,"
     "  x INTEGER NOT NULL, y INTEGER NOT NULL,"
-    "  w INTEGER NOT NULL, h INTEGER NOT NULL"
+    "  w INTEGER NOT NULL, h INTEGER NOT NULL,"
+    "  track INTEGER NOT NULL DEFAULT 0,"
+    "  zone TEXT NOT NULL DEFAULT ''"
     ");"
     "CREATE INDEX IF NOT EXISTS detection_by_event ON detection(event);"
     "CREATE TABLE IF NOT EXISTS media ("
@@ -78,7 +81,48 @@ static const char SCHEMA[] =
     "  path TEXT NOT NULL,"
     "  bytes INTEGER NOT NULL DEFAULT 0"
     ");"
-    "CREATE INDEX IF NOT EXISTS media_by_event ON media(event);";
+    "CREATE INDEX IF NOT EXISTS media_by_event ON media(event);"
+    /*
+     * One row per tracked object, not per detection.  This is what makes
+     * "three people and a car" a different answer from "four hundred
+     * detections", and it is the only table a person reviewing actually
+     * wants to read.
+     */
+    "CREATE TABLE IF NOT EXISTS object ("
+    "  id INTEGER PRIMARY KEY,"
+    "  event INTEGER NOT NULL REFERENCES event(id) ON DELETE CASCADE,"
+    "  track INTEGER NOT NULL,"
+    "  camera TEXT NOT NULL,"
+    "  label TEXT NOT NULL,"
+    "  score REAL NOT NULL DEFAULT 0,"
+    "  first_seen INTEGER NOT NULL,"
+    "  last_seen INTEGER NOT NULL,"
+    "  travelled INTEGER NOT NULL DEFAULT 0,"
+    "  stationary INTEGER NOT NULL DEFAULT 0,"
+    "  zone TEXT NOT NULL DEFAULT ''"
+    ");"
+    /* The tracker's id is unique only within a run, so identity is the
+     * pair: the same object seen again updates its row rather than
+     * adding one. */
+    "CREATE UNIQUE INDEX IF NOT EXISTS object_identity "
+    "ON object(event, track);"
+    "CREATE INDEX IF NOT EXISTS object_by_zone ON object(zone) "
+    "WHERE zone <> '';";
+
+/*
+ * Columns added after the first release.
+ *
+ * A store already holding a fortnight of events is the normal case, so
+ * every addition has to be applied to what is there rather than assumed
+ * from the CREATE above.
+ */
+static bool migrate(sqlite3 *db)
+{
+    return knvr_sqlite_add_column(db, "detection", "track",
+                                  "INTEGER NOT NULL DEFAULT 0") &&
+           knvr_sqlite_add_column(db, "detection", "zone",
+                                  "TEXT NOT NULL DEFAULT ''");
+}
 
 bool knvr_store_open(knvr_store **out, const char *path)
 {
@@ -112,6 +156,13 @@ bool knvr_store_open(knvr_store **out, const char *path)
                        "cannot prepare the event store: %s",
                        message != NULL ? message : "unknown");
         sqlite3_free(message);
+        sqlite3_close(store->db);
+        free(store);
+        return false;
+    }
+    if (!migrate(store->db)) {
+        (void)snprintf(store->error, sizeof(store->error),
+                       "cannot bring the event store up to date");
         sqlite3_close(store->db);
         free(store);
         return false;
@@ -269,8 +320,9 @@ bool knvr_store_add_detection(
     }
     if (sqlite3_prepare_v2(
             store->db,
-            "INSERT INTO detection (event, at, label, score, x, y, w, h) "
-            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);",
+            "INSERT INTO detection "
+            "(event, at, label, score, x, y, w, h, track, zone) "
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10);",
             -1, &statement, NULL) != SQLITE_OK) {
         return fail_sqlite(store, "cannot record a detection");
     }
@@ -283,6 +335,9 @@ bool knvr_store_add_detection(
     (void)sqlite3_bind_int(statement, 6, detection->y);
     (void)sqlite3_bind_int(statement, 7, detection->w);
     (void)sqlite3_bind_int(statement, 8, detection->h);
+    (void)sqlite3_bind_int64(statement, 9, detection->track);
+    (void)sqlite3_bind_text(statement, 10, detection->zone, -1,
+                            SQLITE_TRANSIENT);
     ok = sqlite3_step(statement) == SQLITE_DONE;
     sqlite3_finalize(statement);
     if (!ok) {
@@ -340,6 +395,163 @@ bool knvr_store_add_media(
     return ok;
 }
 
+/* -------------------------------- objects ------------------------------- */
+
+/* Is `zone` already in a comma-separated list? */
+static bool zone_listed(const char *list, const char *zone)
+{
+    const size_t length = strlen(zone);
+    const char *at = list;
+
+    if (length == 0u) {
+        return true;
+    }
+    while ((at = strstr(at, zone)) != NULL) {
+        const bool starts = at == list || at[-1] == ',';
+        const bool ends = at[length] == '\0' || at[length] == ',';
+
+        if (starts && ends) {
+            return true;
+        }
+        at += length;
+    }
+    return false;
+}
+
+static void read_zones(const knvr_store *store, int64_t event, int64_t track,
+                       char *out, size_t size)
+{
+    sqlite3_stmt *statement = NULL;
+
+    out[0] = '\0';
+    if (sqlite3_prepare_v2(store->db,
+                           "SELECT zone FROM object WHERE event = ?1 AND "
+                           "track = ?2;",
+                           -1, &statement, NULL) != SQLITE_OK) {
+        return;
+    }
+    (void)sqlite3_bind_int64(statement, 1, event);
+    (void)sqlite3_bind_int64(statement, 2, track);
+    if (sqlite3_step(statement) == SQLITE_ROW) {
+        const unsigned char *zone = sqlite3_column_text(statement, 0);
+
+        (void)snprintf(out, size, "%s", zone != NULL ? (const char *)zone : "");
+    }
+    sqlite3_finalize(statement);
+}
+
+bool knvr_store_put_object(knvr_store *store, const knvr_object *object)
+{
+    sqlite3_stmt *statement = NULL;
+    char zones[KNVR_STORE_ZONES_MAX];
+    bool ok;
+
+    if (store == NULL || object == NULL) {
+        return false;
+    }
+    /*
+     * Zones accumulate rather than replace.  An object that crosses the
+     * pavement into the drive has been in both, and "show me what came up
+     * the drive" must find it after it has walked on to the porch.
+     */
+    read_zones(store, object->event, object->track, zones, sizeof(zones));
+    if (object->zone[0] != '\0' && !zone_listed(zones, object->zone)) {
+        const size_t used = strlen(zones);
+
+        if (used + strlen(object->zone) + 2u < sizeof(zones)) {
+            (void)snprintf(zones + used, sizeof(zones) - used, "%s%s",
+                           used > 0u ? "," : "", object->zone);
+        }
+    }
+    if (sqlite3_prepare_v2(
+            store->db,
+            "INSERT INTO object (event, track, camera, label, score, "
+            "first_seen, last_seen, travelled, stationary, zone) "
+            "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) "
+            "ON CONFLICT(event, track) DO UPDATE SET "
+            "label = excluded.label, "
+            "score = MAX(object.score, excluded.score), "
+            "last_seen = excluded.last_seen, "
+            "travelled = excluded.travelled, "
+            "stationary = excluded.stationary, "
+            "zone = excluded.zone;",
+            -1, &statement, NULL) != SQLITE_OK) {
+        return fail_sqlite(store, "cannot record an object");
+    }
+    (void)sqlite3_bind_int64(statement, 1, object->event);
+    (void)sqlite3_bind_int64(statement, 2, object->track);
+    (void)sqlite3_bind_text(statement, 3, object->camera, -1,
+                            SQLITE_TRANSIENT);
+    (void)sqlite3_bind_text(statement, 4, object->label, -1, SQLITE_TRANSIENT);
+    (void)sqlite3_bind_double(statement, 5, object->score);
+    (void)sqlite3_bind_int64(statement, 6, object->first_seen);
+    (void)sqlite3_bind_int64(statement, 7, object->last_seen);
+    (void)sqlite3_bind_int(statement, 8, object->travelled);
+    (void)sqlite3_bind_int(statement, 9, object->stationary ? 1 : 0);
+    (void)sqlite3_bind_text(statement, 10, zones, -1, SQLITE_TRANSIENT);
+    ok = sqlite3_step(statement) == SQLITE_DONE;
+    sqlite3_finalize(statement);
+    if (!ok) {
+        return fail_sqlite(store, "cannot record an object");
+    }
+    return true;
+}
+
+bool knvr_store_objects(
+    const knvr_store *store, int64_t event_id, knvr_object *out,
+    size_t capacity, size_t *count)
+{
+    knvr_store *mutable_store = (knvr_store *)store;
+    sqlite3_stmt *statement = NULL;
+    size_t total = 0u;
+
+    if (count != NULL) {
+        *count = 0u;
+    }
+    if (store == NULL) {
+        return false;
+    }
+    if (sqlite3_prepare_v2(
+            store->db,
+            "SELECT id, event, track, camera, label, score, first_seen, "
+            "last_seen, travelled, stationary, zone FROM object "
+            "WHERE event = ?1 ORDER BY first_seen;",
+            -1, &statement, NULL) != SQLITE_OK) {
+        return fail_sqlite(mutable_store, "cannot query objects");
+    }
+    (void)sqlite3_bind_int64(statement, 1, event_id);
+    while (sqlite3_step(statement) == SQLITE_ROW) {
+        if (out != NULL && total < capacity) {
+            knvr_object *object = &out[total];
+            const unsigned char *camera = sqlite3_column_text(statement, 3);
+            const unsigned char *label = sqlite3_column_text(statement, 4);
+            const unsigned char *zone = sqlite3_column_text(statement, 10);
+
+            (void)memset(object, 0, sizeof(*object));
+            object->id = sqlite3_column_int64(statement, 0);
+            object->event = sqlite3_column_int64(statement, 1);
+            object->track = sqlite3_column_int64(statement, 2);
+            (void)snprintf(object->camera, sizeof(object->camera), "%s",
+                           camera != NULL ? (const char *)camera : "");
+            (void)snprintf(object->label, sizeof(object->label), "%s",
+                           label != NULL ? (const char *)label : "");
+            object->score = sqlite3_column_double(statement, 5);
+            object->first_seen = sqlite3_column_int64(statement, 6);
+            object->last_seen = sqlite3_column_int64(statement, 7);
+            object->travelled = sqlite3_column_int(statement, 8);
+            object->stationary = sqlite3_column_int(statement, 9) != 0;
+            (void)snprintf(object->zone, sizeof(object->zone), "%s",
+                           zone != NULL ? (const char *)zone : "");
+        }
+        total++;
+    }
+    sqlite3_finalize(statement);
+    if (count != NULL) {
+        *count = total;
+    }
+    return true;
+}
+
 /* -------------------------------- queries ------------------------------- */
 
 void knvr_query_init(knvr_query *query)
@@ -392,7 +604,12 @@ bool knvr_store_events(
             "SELECT id, camera, started, ended, trigger, motion_frames, "
             "best_score, best_label FROM event WHERE "
             "(?1 = 0 OR started >= ?1) AND (?2 = 0 OR started <= ?2) AND "
-            "(?3 = '' OR camera = ?3) AND best_score >= ?4 "
+            "(?3 = '' OR camera = ?3) AND best_score >= ?4 AND "
+            /* An object's zone column is a list, so membership is a
+             * bounded LIKE rather than equality. */
+            "(?6 = '' OR EXISTS (SELECT 1 FROM object WHERE "
+            "object.event = event.id AND "
+            "(',' || object.zone || ',') LIKE ('%,' || ?6 || ',%'))) "
             "ORDER BY started DESC LIMIT ?5;",
             -1, &statement, NULL) != SQLITE_OK) {
         return fail_sqlite(mutable_store, "cannot query events");
@@ -404,6 +621,7 @@ bool knvr_store_events(
     (void)sqlite3_bind_double(statement, 4, query->min_score);
     (void)sqlite3_bind_int(statement, 5,
                            query->limit > 0 ? query->limit : DEFAULT_LIMIT);
+    (void)sqlite3_bind_text(statement, 6, query->zone, -1, SQLITE_TRANSIENT);
     while (sqlite3_step(statement) == SQLITE_ROW) {
         if (out != NULL && total < capacity) {
             read_event(statement, &out[total]);
@@ -433,8 +651,8 @@ bool knvr_store_detections(
     }
     if (sqlite3_prepare_v2(
             store->db,
-            "SELECT event, at, label, score, x, y, w, h FROM detection "
-            "WHERE event = ?1 ORDER BY at;",
+            "SELECT event, at, label, score, x, y, w, h, track, zone "
+            "FROM detection WHERE event = ?1 ORDER BY at;",
             -1, &statement, NULL) != SQLITE_OK) {
         return fail_sqlite(mutable_store, "cannot query detections");
     }
@@ -442,6 +660,7 @@ bool knvr_store_detections(
     while (sqlite3_step(statement) == SQLITE_ROW) {
         if (out != NULL && total < capacity) {
             const unsigned char *label = sqlite3_column_text(statement, 2);
+            const unsigned char *zone = sqlite3_column_text(statement, 9);
 
             (void)memset(&out[total], 0, sizeof(out[total]));
             out[total].event = sqlite3_column_int64(statement, 0);
@@ -453,6 +672,9 @@ bool knvr_store_detections(
             out[total].y = sqlite3_column_int(statement, 5);
             out[total].w = sqlite3_column_int(statement, 6);
             out[total].h = sqlite3_column_int(statement, 7);
+            out[total].track = sqlite3_column_int64(statement, 8);
+            (void)snprintf(out[total].zone, sizeof(out[total].zone), "%s",
+                           zone != NULL ? (const char *)zone : "");
         }
         total++;
     }

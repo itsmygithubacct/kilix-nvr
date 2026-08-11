@@ -112,6 +112,35 @@ static void draw_list(
     }
 }
 
+/*
+ * What the event was, under the picture of it.
+ *
+ * Objects rather than detections: forty rows saying "person" is not a
+ * report, and "one person, eleven seconds, in the drive" is.
+ */
+static void draw_objects(sr_canvas *frame, const knvr_object *objects,
+                         size_t count, int x, int y)
+{
+    char line[128];
+
+    if (count == 0u) {
+        return;
+    }
+    for (size_t i = 0u; i < count && i < 6u; i++) {
+        const knvr_object *object = &objects[i];
+        const uint32_t colour =
+            strcmp(object->label, "person") == 0 ? PERSON : MARK;
+
+        (void)snprintf(line, sizeof(line), "%s %.2f  %llds  %s%s",
+                       object->label, object->score,
+                       (long long)(object->last_seen - object->first_seen),
+                       object->zone[0] != '\0' ? object->zone : "-",
+                       object->stationary ? "  parked" : "");
+        sr_text(frame, (float)x, (float)(y + (int)i * 14), line, colour,
+                1.0f, 1);
+    }
+}
+
 static void draw_still(sr_canvas *frame, const sr_canvas *still,
                        const knvr_event *event)
 {
@@ -153,6 +182,8 @@ int knvr_review(knvr_store *store)
     sr_canvas frame;
     sr_canvas still;
     knvr_event *events;
+    knvr_object objects[16];
+    size_t object_count = 0u;
     uint8_t *rgba = NULL;
     size_t count = 0u;
     size_t picked = 0u;
@@ -221,11 +252,19 @@ int knvr_review(knvr_store *store)
                     have_still = false;
                 }
                 have_still = load_still(store, event->id, &still);
+                object_count = 0u;
+                (void)knvr_store_objects(store, event->id, objects, 16u,
+                                         &object_count);
+                if (object_count > 16u) {
+                    object_count = 16u;
+                }
                 shown = event->id;
             }
             sr_clear(&frame, BACKDROP);
             draw_list(&frame, events, count, picked, top);
             draw_still(&frame, have_still ? &still : NULL, event);
+            draw_objects(&frame, objects, object_count, LIST_WIDTH + 8,
+                         height - 110);
             sr_text(&frame, 8.0f, (float)(height - 16),
                     "up/down select   q quit", DIM, 1.0f, 1);
             if (sr_pack_rgba(&frame, rgba,

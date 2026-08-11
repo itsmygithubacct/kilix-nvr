@@ -8,6 +8,7 @@
  */
 
 #include "knvr_sound.h"
+#include "knvr_command.h"
 #include "knvr_detect.h"
 
 #include <errno.h>
@@ -21,6 +22,14 @@
 #include <unistd.h>
 
 #define ERROR_MAX 160
+
+/*
+ * Words in the listener command.  Enough for a venv python, the tool, a
+ * model path and a threshold; longer than that is refused before the
+ * fork rather than truncated, because a silently shortened command line
+ * runs *something*, and working out which is nobody's afternoon.
+ */
+#define KNVR_SOUND_ARGV_MAX 15
 
 struct knvr_sound {
     pid_t ffmpeg;
@@ -130,8 +139,18 @@ static pid_t spawn_ffmpeg(const char *url, const char *log_path, int *out_fd)
         argv[count++] = (char *)"-loglevel";
         argv[count++] = (char *)"warning";
         argv[count++] = (char *)"-nostdin";
-        argv[count++] = (char *)"-rtsp_transport";
-        argv[count++] = (char *)"tcp";
+        /*
+         * Only for an RTSP input.  ffmpeg refuses a demuxer option the
+         * demuxer does not have - "Option rtsp_transport not found" and
+         * exit 1 - so passing it unconditionally would mean this path
+         * could never read anything but a camera.  Being able to point it
+         * at a file is what makes the whole audio path testable without
+         * one.
+         */
+        if (strncmp(url, "rtsp://", 7) == 0) {
+            argv[count++] = (char *)"-rtsp_transport";
+            argv[count++] = (char *)"tcp";
+        }
         argv[count++] = (char *)"-i";
         argv[count++] = (char *)url;
         argv[count++] = (char *)"-vn";
@@ -155,6 +174,9 @@ bool knvr_sound_start(
     knvr_sound **out, const char *url, const knvr_sound_options *options)
 {
     static const char *const DEFAULT_ARGV[] = {"kilix-nvr-listen", NULL};
+    const char *env_argv[KNVR_SOUND_ARGV_MAX + 1];
+    char env_storage[512];
+    const char *const *chosen;
     knvr_sound_options defaults;
     knvr_sound *sound;
     int to_child[2];
@@ -184,6 +206,29 @@ bool knvr_sound_start(
         free(sound);
         return false;
     }
+    chosen = options->argv;
+    if (chosen == NULL &&
+        knvr_command_from_env("KILIX_NVR_LISTEN", env_storage,
+                              sizeof(env_storage), env_argv,
+                              KNVR_SOUND_ARGV_MAX + 1u)) {
+        chosen = env_argv;
+    }
+    if (chosen == NULL) {
+        chosen = DEFAULT_ARGV;
+    }
+    {
+        size_t words = 0u;
+
+        while (chosen[words] != NULL) {
+            words++;
+        }
+        if (words == 0u || words > KNVR_SOUND_ARGV_MAX) {
+            (void)close(to_child[0]); (void)close(to_child[1]);
+            (void)close(from_child[0]); (void)close(from_child[1]);
+            free(sound);
+            return false;
+        }
+    }
     sound->classifier = fork();
     if (sound->classifier < 0) {
         (void)close(to_child[0]); (void)close(to_child[1]);
@@ -192,16 +237,15 @@ bool knvr_sound_start(
         return false;
     }
     if (sound->classifier == 0) {
-        const char *const *argv =
-            options->argv != NULL ? options->argv : DEFAULT_ARGV;
-        char *child_argv[8];
+        const char *const *argv = chosen;
+        char *child_argv[KNVR_SOUND_ARGV_MAX + 1];
         size_t count = 0u;
 
         (void)dup2(to_child[0], STDIN_FILENO);
         (void)dup2(from_child[1], STDOUT_FILENO);
         (void)close(to_child[0]); (void)close(to_child[1]);
         (void)close(from_child[0]); (void)close(from_child[1]);
-        while (argv[count] != NULL && count < 6u) {
+        while (argv[count] != NULL && count < KNVR_SOUND_ARGV_MAX) {
             child_argv[count] = (char *)argv[count];
             count++;
         }

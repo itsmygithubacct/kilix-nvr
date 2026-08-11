@@ -57,18 +57,24 @@ VENDOR_LDLIBS := -lz
 
 OBJECTS := \
 	$(BUILD_DIR)/knvr_paths.o \
+	$(BUILD_DIR)/knvr_command.o \
 	$(BUILD_DIR)/knvr_config.o \
 	$(BUILD_DIR)/knvr_detect.o \
 	$(BUILD_DIR)/knvr_review.o \
 	$(BUILD_DIR)/knvr_sound.o \
+	$(BUILD_DIR)/knvr_sqlite.o \
 	$(BUILD_DIR)/knvr_store.o \
-	$(BUILD_DIR)/knvr_watch.o
+	$(BUILD_DIR)/knvr_track.o \
+	$(BUILD_DIR)/knvr_watch.o \
+	$(BUILD_DIR)/knvr_zone.o
 
 STATIC_LIB := $(BUILD_DIR)/lib$(PROJECT).a
 COMMAND := $(BUILD_DIR)/$(PROJECT)
 
 TESTS := $(BUILD_DIR)/test-config $(BUILD_DIR)/test-detect \
-	$(BUILD_DIR)/test-store $(BUILD_DIR)/test-watch
+	$(BUILD_DIR)/test-sound $(BUILD_DIR)/test-store \
+	$(BUILD_DIR)/test-track $(BUILD_DIR)/test-watch \
+	$(BUILD_DIR)/test-zone
 
 .DEFAULT_GOAL := all
 .PHONY: all test sanitize install clean
@@ -118,9 +124,16 @@ sanitize: LDFLAGS += -fsanitize=address,undefined
 sanitize: clean
 	@$(MAKE) --no-print-directory CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" test
 
+# The detector, the listener and the model fetcher go with the binary:
+# knvr_detect and knvr_sound spawn them by name off PATH, so a command
+# installed without them is a recorder that silently never detects.
+TOOLS := tools/kilix-nvr-detect tools/kilix-nvr-listen \
+	tools/kilix-nvr-fetch-model
+
 install: all
 	$(INSTALL) -d $(DESTDIR)$(PREFIX)/bin
 	$(INSTALL) -m 755 $(COMMAND) $(DESTDIR)$(PREFIX)/bin/
+	$(INSTALL) -m 755 $(TOOLS) $(DESTDIR)$(PREFIX)/bin/
 
 clean:
 	rm -rf $(BUILD_DIR)
