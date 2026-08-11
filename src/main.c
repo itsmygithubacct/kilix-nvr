@@ -12,6 +12,8 @@
 #include "knvr_paths.h"
 #include "knvr_review.h"
 #include "knvr_sound.h"
+#include "knvr_track.h"
+#include "knvr_zone.h"
 
 #include "soft_raster.h"
 #include "knvr_store.h"
@@ -41,7 +43,12 @@ static int usage(FILE *stream)
         "  watch <name> [--seconds N] [--render OUT.ppm]\n"
         "                          decode one camera and record what moves\n"
         "  events [--since SECONDS] [--camera NAME] [--min-score S]\n"
-        "                          what happened\n"
+        "         [--zone NAME]    what happened\n"
+        "  objects <event>         the things it was, not the frames\n"
+        "  zones <name>            a camera's zones and what they do\n"
+        "  zone add <name> <zone> [inertia=N] [preclusive=yes] [loiter=S]\n"
+        "  zone remove <name> <zone>\n"
+        "  zone paint <name>       grab a frame and paint its zones\n"
         "  review                  browse events with the frame that caused\n"
         "                          them; up/down to select, q to quit\n"
         "  play <event>            print the footage covering an event\n"
@@ -54,7 +61,7 @@ static int usage(FILE *stream)
         "\n"
         "Capabilities: record=off|stills|clips|continuous,\n"
         "detect=off|always|on-view, motion=on|off, audio=on|off,\n"
-        "sound_events=on|off, retain_days=N, mask=PATH\n"
+        "sound_events=on|off, retain_days=N, mask=PATH, zones=PATH\n"
         "\n"
         "Cameras and their URLs come from kilix-rtsp's cameras.conf; this\n"
         "stores only what to do with them.  Data lives under\n"
@@ -262,9 +269,67 @@ static int selftest(void)
 
     TEST("it can be removed", knvr_config_remove(config, "selftest-cam"));
     TEST("and is gone", !knvr_config_get(config, "selftest-cam", &camera));
-
     knvr_config_close(config);
     (void)remove(path);
+
+    /* Tracking: the property everything downstream rests on is that the
+     * same thing keeps one id. */
+    {
+        knvr_tracker *tracker = NULL;
+        knvr_detection_box seen;
+        int64_t first;
+
+        (void)memset(&seen, 0, sizeof(seen));
+        seen.class_id = 0;
+        seen.score = 0.9f;
+        seen.x = 100; seen.y = 100; seen.w = 40; seen.h = 80;
+        TEST("a tracker starts", knvr_tracker_create(&tracker, NULL));
+        TEST("it takes a detection",
+             knvr_tracker_update(tracker, &seen, 1u, 1000));
+        first = knvr_tracker_assigned(tracker, 0u);
+        seen.x = 112;
+        TEST("and the same object keeps its id",
+             knvr_tracker_update(tracker, &seen, 1u, 1300) &&
+                 knvr_tracker_assigned(tracker, 0u) == first);
+        seen.x = 460;
+        seen.y = 300;
+        TEST("while something elsewhere is a new one",
+             knvr_tracker_update(tracker, &seen, 1u, 1600) &&
+                 knvr_tracker_assigned(tracker, 0u) != first);
+        knvr_tracker_free(tracker);
+    }
+
+    /* Zones: define, read back, and remove. */
+    {
+        knvr_zones *zones = NULL;
+        const char *why = NULL;
+        uint8_t region = 0u;
+        char map[KNVR_PATH_MAX];
+
+        TEST("a zone map path resolves",
+             knvr_paths_state_file(map, sizeof(map), "selftest-zones.png"));
+        (void)remove(map);
+        TEST("a zone can be defined",
+             knvr_zones_define(map, "selftest-zone", 640, 360, 2, true, 15,
+                               &region, &why));
+        TEST("with the first free region", region == 1u);
+        TEST("the same name twice is refused",
+             !knvr_zones_define(map, "selftest-zone", 0, 0, 1, false, 0,
+                                &region, &why) && why != NULL);
+        TEST("it reads back", knvr_zones_load(&zones, map, 640, 360));
+        TEST("with its policy",
+             knvr_zones_find(zones, "selftest-zone") != NULL &&
+                 knvr_zones_find(zones, "selftest-zone")->inertia == 2 &&
+                 knvr_zones_find(zones, "selftest-zone")->preclusive &&
+                 knvr_zone_is_preclusive(zones, 1u));
+        knvr_zones_free(zones);
+        TEST("and can be removed",
+             knvr_zones_undefine(map, "selftest-zone", &why));
+        TEST("only once",
+             !knvr_zones_undefine(map, "selftest-zone", &why));
+        (void)remove(map);
+    }
+
     (void)printf("selftest passed\n");
     return 0;
 }
@@ -275,6 +340,9 @@ static int command_prune(knvr_config *config, int argc, char **argv);
 static int command_play(int argc, char **argv);
 static int command_clip(int argc, char **argv);
 static int command_reanalyze(int argc, char **argv);
+static int command_objects(int argc, char **argv);
+static int command_zones(knvr_config *config, int argc, char **argv);
+static int command_zone(knvr_config *config, int argc, char **argv);
 
 int main(int argc, char **argv)
 {
@@ -324,6 +392,12 @@ int main(int argc, char **argv)
         status = command_clip(argc - 2, argv + 2);
     } else if (strcmp(command, "reanalyze") == 0) {
         status = command_reanalyze(argc - 2, argv + 2);
+    } else if (strcmp(command, "objects") == 0) {
+        status = command_objects(argc - 2, argv + 2);
+    } else if (strcmp(command, "zones") == 0) {
+        status = command_zones(config, argc - 2, argv + 2);
+    } else if (strcmp(command, "zone") == 0) {
+        status = command_zone(config, argc - 2, argv + 2);
     } else if (strcmp(command, "prune") == 0) {
         status = command_prune(config, argc - 2, argv + 2);
     } else if (strcmp(command, "remove") == 0) {
@@ -436,13 +510,33 @@ static void save_still(knvr_store *store, int64_t event_id,
     }
 }
 
+/*
+ * Milliseconds from a clock that does not step.
+ *
+ * The tracker ages objects by duration, and time(NULL) can go backwards
+ * when ntp corrects the machine - which would make every track either
+ * immortal or instantly stale.
+ */
+static int64_t monotonic_ms(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return (int64_t)time(NULL) * 1000;
+    }
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
 static int command_watch(knvr_config *config, int argc, char **argv)
 {
     knvr_watch_options options;
     knvr_store *store = NULL;
     knvr_detector *detector = NULL;
     knvr_sound *sound = NULL;
+    knvr_tracker *tracker = NULL;
+    knvr_zones *zones = NULL;
     knvr_watch *watch = NULL;
+    uint64_t suppressed = 0u;
     int64_t event_id = 0;
     time_t last_motion = 0;
     knvr_watch_stats stats;
@@ -450,6 +544,7 @@ static int command_watch(knvr_config *config, int argc, char **argv)
     knvr_box boxes[KNVR_MOTION_BOX_MAX];
     char url[KRTSP_URL_MAX];
     char mask_path[KNVR_PATH_MAX];
+    char zones_path[KNVR_PATH_MAX];
     char log_path[KNVR_PATH_MAX];
     char sound_log[KNVR_PATH_MAX];
     const char *render = NULL;
@@ -536,6 +631,37 @@ static int command_watch(knvr_config *config, int argc, char **argv)
                  knvr_watch_width(watch), knvr_watch_height(watch), seconds,
                  options.mask_path != NULL ? " (masked)" : "");
 
+    {
+        knvr_tracker_options track_options;
+
+        knvr_tracker_options_init(&track_options);
+        if (!knvr_tracker_create(&tracker, &track_options)) {
+            (void)fprintf(stderr,
+                          "kilix-nvr: %s: no tracker; detections only\n",
+                          name);
+        }
+    }
+    /* Loaded after the camera, because the map has to be reconciled
+     * against the geometry the boxes will actually arrive in. */
+    if (camera.zones[0] != '\0') {
+        char directory[KNVR_PATH_MAX];
+
+        if (knvr_paths_subdir(directory, sizeof(directory), "zones") &&
+            snprintf(zones_path, sizeof(zones_path), "%s/%s", directory,
+                     camera.zones) > 0) {
+            if (!knvr_zones_load(&zones, zones_path,
+                                 knvr_watch_width(watch),
+                                 knvr_watch_height(watch))) {
+                (void)fprintf(stderr,
+                              "kilix-nvr: %s: cannot read the zone map; "
+                              "no zones\n", name);
+            } else {
+                (void)printf("  %zu zone%s\n", knvr_zones_count(zones),
+                             knvr_zones_count(zones) == 1u ? "" : "s");
+            }
+        }
+    }
+
 
     if (camera.sound_events) {
         knvr_sound_options sound_options;
@@ -594,6 +720,30 @@ static int command_watch(knvr_config *config, int argc, char **argv)
             (void)nanosleep(&pause, NULL);
             continue;
         }
+        /*
+         * Preclusive zones act here, at the gate, which is where
+         * ZoneMinder puts them: movement in a zone marked preclusive is
+         * not evidence of anything, so it must not open an event and
+         * must not wake the detector.  Dropped regions are counted and
+         * reported at the end - a suppression nobody can see is
+         * indistinguishable from a camera that stopped working.
+         */
+        if (zones != NULL && count > 0u) {
+            size_t kept = 0u;
+
+            for (size_t b = 0u; b < count; b++) {
+                const uint8_t region = knvr_zones_at_point(
+                    zones, boxes[b].x + boxes[b].w / 2,
+                    boxes[b].y + boxes[b].h - 1);
+
+                if (knvr_zone_is_preclusive(zones, region)) {
+                    suppressed++;
+                    continue;
+                }
+                boxes[kept++] = boxes[b];
+            }
+            count = kept;
+        }
         if (count > 0u) {
             const int64_t at = (int64_t)time(NULL);
 
@@ -618,6 +768,63 @@ static int command_watch(knvr_config *config, int argc, char **argv)
 
                 if (knvr_detector_run(detector, frame, found,
                                       KNVR_DETECT_ROWS, &detections)) {
+                    /* Zones are resolved per track rather than per
+                     * detection, because inertia belongs to the object:
+                     * "has been in the drive for three frames" is a fact
+                     * about the car, not about the frame. */
+                    char zone_of[KNVR_TRACK_MAX][KNVR_STORE_LABEL_MAX];
+                    int64_t zone_track[KNVR_TRACK_MAX];
+                    size_t zone_count = 0u;
+
+                    (void)knvr_tracker_update(tracker, found, detections,
+                                              monotonic_ms());
+                    for (size_t t = 0u; t < KNVR_TRACK_MAX; t++) {
+                        const knvr_track *object = knvr_tracker_at(tracker, t);
+                        knvr_object row;
+                        knvr_zone_hit hit;
+
+                        if (object == NULL) {
+                            break;
+                        }
+                        (void)memset(&hit, 0, sizeof(hit));
+                        if (zones != NULL) {
+                            (void)knvr_zones_track(zones, object->id,
+                                                   &object->box,
+                                                   monotonic_ms(), &hit);
+                        }
+                        zone_track[zone_count] = object->id;
+                        zone_of[zone_count][0] = '\0';
+                        if (hit.settled) {
+                            const char *zone_name =
+                                knvr_zone_name(zones, hit.region);
+
+                            if (zone_name != NULL) {
+                                (void)snprintf(zone_of[zone_count],
+                                               KNVR_STORE_LABEL_MAX, "%s",
+                                               zone_name);
+                            }
+                        }
+                        zone_count++;
+                        if (!object->confirmed) {
+                            continue;
+                        }
+                        (void)memset(&row, 0, sizeof(row));
+                        row.event = event_id;
+                        row.track = object->id;
+                        (void)snprintf(row.camera, sizeof(row.camera), "%s",
+                                       name);
+                        (void)snprintf(row.label, sizeof(row.label), "%s",
+                                       knvr_detect_label(object->class_id));
+                        row.score = (double)object->score;
+                        row.first_seen = at;
+                        row.last_seen = at;
+                        row.travelled = object->travelled;
+                        row.stationary = object->stationary;
+                        (void)snprintf(row.zone, sizeof(row.zone), "%.*s",
+                                       KNVR_STORE_LABEL_MAX - 1,
+                                       zone_of[zone_count - 1u]);
+                        (void)knvr_store_put_object(store, &row);
+                    }
                     for (size_t d = 0u; d < detections; d++) {
                         knvr_detection record;
 
@@ -632,9 +839,21 @@ static int command_watch(knvr_config *config, int argc, char **argv)
                         record.y = found[d].y;
                         record.w = found[d].w;
                         record.h = found[d].h;
+                        record.track = knvr_tracker_assigned(tracker, d);
+                        for (size_t z = 0u; z < zone_count; z++) {
+                            if (zone_track[z] == record.track) {
+                                (void)snprintf(record.zone,
+                                               sizeof(record.zone), "%.*s",
+                                               KNVR_STORE_LABEL_MAX - 1,
+                                               zone_of[z]);
+                                break;
+                            }
+                        }
                         (void)knvr_store_add_detection(store, &record);
-                        (void)printf("    %s %.2f\n", record.label,
-                                     record.score);
+                        (void)printf("    %s %.2f%s%s (track %lld)\n",
+                                     record.label, record.score,
+                                     record.zone[0] != '\0' ? " in " : "",
+                                     record.zone, (long long)record.track);
                     }
                     if (detections > 0u && camera.record != KNVR_RECORD_OFF) {
                         save_still(store, event_id, name, frame,
@@ -648,9 +867,20 @@ static int command_watch(knvr_config *config, int argc, char **argv)
                     detector = NULL;
                 }
             }
-            /* The first frame with motion is the one worth looking at,
-             * so that is the one written. */
-            if (render != NULL && rendered == 0) {
+            /*
+             * The first frame with motion, then once more as soon as a
+             * track is confirmed.
+             *
+             * Written twice on purpose: the first motion frame is the one
+             * worth looking at when nothing is being tracked, but a
+             * tracker needs two sightings before it believes anything, so
+             * a single early render could never show a track box and the
+             * overlay would look broken.
+             */
+            if (render != NULL &&
+                (rendered == 0 ||
+                 (rendered == 1 && knvr_tracker_count(tracker) > 0u &&
+                  knvr_tracker_at(tracker, 0u)->confirmed))) {
                 uint8_t *copy = malloc((size_t)knvr_watch_width(watch) *
                                        (size_t)knvr_watch_height(watch) * 4u);
 
@@ -661,10 +891,13 @@ static int command_watch(knvr_config *config, int argc, char **argv)
                     knvr_watch_draw_boxes(copy, knvr_watch_width(watch),
                                           knvr_watch_height(watch), boxes,
                                           count);
+                    knvr_track_draw(copy, knvr_watch_width(watch),
+                                    knvr_watch_height(watch), tracker);
                     if (write_ppm(render, copy, knvr_watch_width(watch),
                                   knvr_watch_height(watch)) == 0) {
-                        (void)printf("  wrote %s\n", render);
-                        rendered = 1;
+                        (void)printf("  wrote %s%s\n", render,
+                                     rendered == 0 ? "" : " (with tracks)");
+                        rendered = rendered == 0 ? 1 : 2;
                     }
                     free(copy);
                 }
@@ -733,9 +966,21 @@ static int command_watch(knvr_config *config, int argc, char **argv)
                  (unsigned long long)stats.frames,
                  (unsigned long long)stats.motion_frames,
                  (unsigned long long)stats.boxes, stats.last_age_ms);
+    if (tracker != NULL) {
+        (void)printf("%lld object%s tracked\n",
+                     (long long)knvr_tracker_total(tracker),
+                     knvr_tracker_total(tracker) == 1 ? "" : "s");
+    }
+    if (suppressed > 0u) {
+        (void)printf("%llu motion region%s suppressed by preclusive zones\n",
+                     (unsigned long long)suppressed,
+                     suppressed == 1u ? "" : "s");
+    }
     knvr_watch_stop(watch);
     knvr_detector_stop(detector);
     knvr_sound_stop(sound);
+    knvr_tracker_free(tracker);
+    knvr_zones_free(zones);
     knvr_store_close(store);
     return 0;
 }
@@ -774,6 +1019,8 @@ static int command_events(int argc, char **argv)
                            argv[++i]);
         } else if (strcmp(argv[i], "--min-score") == 0 && i + 1 < argc) {
             query.min_score = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--zone") == 0 && i + 1 < argc) {
+            (void)snprintf(query.zone, sizeof(query.zone), "%s", argv[++i]);
         } else {
             return usage(stderr);
         }
@@ -1184,4 +1431,301 @@ static int command_reanalyze(int argc, char **argv)
     sr_canvas_free(&still);
     knvr_store_close(store);
     return status;
+}
+
+/* ------------------------- objects and zones ----------------------------- */
+
+static int command_objects(int argc, char **argv)
+{
+    knvr_store *store = NULL;
+    knvr_object objects[64];
+    size_t count = 0u;
+    int64_t wanted;
+
+    if (argc != 1) {
+        return usage(stderr);
+    }
+    wanted = atoll(argv[0]);
+    if (!knvr_store_open(&store, NULL)) {
+        (void)fprintf(stderr, "kilix-nvr: cannot open the event store\n");
+        return 1;
+    }
+    if (!knvr_store_objects(store, wanted, objects, 64u, &count)) {
+        knvr_store_close(store);
+        return 1;
+    }
+    if (count == 0u) {
+        (void)printf("event %lld tracked nothing\n", (long long)wanted);
+        knvr_store_close(store);
+        return 0;
+    }
+    (void)printf("%-6s %-10s %-6s %-9s %-8s %s\n", "TRACK", "WHAT", "SCORE",
+                 "SECONDS", "MOVED", "ZONES");
+    for (size_t i = 0u; i < count && i < 64u; i++) {
+        const knvr_object *object = &objects[i];
+
+        (void)printf("%-6lld %-10s %-6.2f %-9lld %-8d %s%s\n",
+                     (long long)object->track, object->label, object->score,
+                     (long long)(object->last_seen - object->first_seen),
+                     object->travelled,
+                     object->zone[0] != '\0' ? object->zone : "-",
+                     object->stationary ? "  (parked)" : "");
+    }
+    knvr_store_close(store);
+    return 0;
+}
+
+/*
+ * Where a camera's zone map lives.
+ *
+ * One map per camera, named after it, so `zone add` needs no path and a
+ * map cannot end up attached to the wrong camera.
+ */
+static bool zone_map_path(const char *camera, char *out, size_t size)
+{
+    char directory[KNVR_PATH_MAX];
+
+    if (!knvr_paths_subdir(directory, sizeof(directory), "zones")) {
+        return false;
+    }
+    return snprintf(out, size, "%s/%s.png", directory, camera) > 0;
+}
+
+/*
+ * One frame from a camera, for sizing or painting a zone map.
+ *
+ * `ppm` may be NULL when only the geometry is wanted.  Fifteen seconds:
+ * the connection grace alone is ten, and a camera that has not produced a
+ * frame by then is not going to during this command.
+ */
+static bool grab_frame(const char *camera, const char *ppm, int *width,
+                       int *height)
+{
+    knvr_watch_options options;
+    knvr_watch *watch = NULL;
+    char url[KRTSP_URL_MAX];
+    char log_path[KNVR_PATH_MAX];
+    time_t deadline;
+    bool ok = false;
+
+    if (!resolve_url(camera, true, url, sizeof(url))) {
+        (void)fprintf(stderr,
+                      "kilix-nvr: no stream URL for '%s' in cameras.conf\n",
+                      camera);
+        return false;
+    }
+    knvr_watch_options_init(&options);
+    if (knvr_paths_state_file(log_path, sizeof(log_path), "ffmpeg.log")) {
+        options.log_path = log_path;
+    }
+    if (!knvr_watch_start(&watch, url, &options)) {
+        (void)fprintf(stderr, "kilix-nvr: %s: cannot reach the camera\n",
+                      camera);
+        knvr_watch_stop(watch);
+        return false;
+    }
+    deadline = time(NULL) + 15;
+    while (time(NULL) < deadline) {
+        const uint8_t *frame = NULL;
+        knvr_box boxes[KNVR_MOTION_BOX_MAX];
+        size_t count = 0u;
+        struct timespec pause = {0, 100 * 1000 * 1000};
+
+        if (!knvr_watch_step(watch, &frame, boxes, KNVR_MOTION_BOX_MAX,
+                             &count)) {
+            (void)nanosleep(&pause, NULL);
+            continue;
+        }
+        *width = knvr_watch_width(watch);
+        *height = knvr_watch_height(watch);
+        ok = ppm == NULL || write_ppm(ppm, frame, *width, *height) == 0;
+        break;
+    }
+    if (!ok) {
+        (void)fprintf(stderr, "kilix-nvr: %s: no frame arrived\n", camera);
+    }
+    knvr_watch_stop(watch);
+    return ok;
+}
+
+static int command_zones(knvr_config *config, int argc, char **argv)
+{
+    knvr_camera camera;
+    knvr_zones *zones = NULL;
+    char path[KNVR_PATH_MAX];
+
+    if (argc != 1) {
+        return usage(stderr);
+    }
+    if (!knvr_config_get(config, argv[0], &camera)) {
+        (void)fprintf(stderr, "kilix-nvr: no camera named '%s'\n", argv[0]);
+        return 1;
+    }
+    if (!zone_map_path(argv[0], path, sizeof(path))) {
+        return 1;
+    }
+    /* Listing does not need the camera, so the geometry here is nominal:
+     * cells and names are what is being reported, not positions. */
+    if (!knvr_zones_load(&zones, path, 1000, 1000)) {
+        (void)printf("no zones for %s; make one with `kilix-nvr zone add "
+                     "%s <zone>`\n", argv[0], argv[0]);
+        return 0;
+    }
+    if (camera.zones[0] == '\0') {
+        (void)printf("note: %s has a zone map but zones= is unset, so "
+                     "nothing reads it\n", argv[0]);
+    }
+    (void)printf("%-3s %-16s %-8s %-11s %-8s %s\n", "ID", "ZONE", "INERTIA",
+                 "PRECLUSIVE", "LOITER", "CELLS");
+    for (size_t i = 0u; i < knvr_zones_count(zones); i++) {
+        const knvr_zone *zone = knvr_zones_at(zones, i);
+        char loiter[16];
+
+        if (zone->loiter_seconds > 0) {
+            (void)snprintf(loiter, sizeof(loiter), "%ds",
+                           zone->loiter_seconds);
+        } else {
+            (void)snprintf(loiter, sizeof(loiter), "-");
+        }
+        (void)printf("%-3u %-16s %-8d %-11s %-8s %zu\n", zone->region,
+                     zone->name, zone->inertia,
+                     zone->preclusive ? "yes" : "no", loiter, zone->cells);
+        if (zone->cells == 0u) {
+            (void)printf("    nothing painted yet: `kilix-nvr zone paint "
+                         "%s`, then press %u\n", argv[0], zone->region);
+        }
+    }
+    knvr_zones_free(zones);
+    return 0;
+}
+
+static int command_zone(knvr_config *config, int argc, char **argv)
+{
+    knvr_camera camera;
+    char path[KNVR_PATH_MAX];
+    const char *action;
+    const char *name;
+
+    if (argc < 2) {
+        return usage(stderr);
+    }
+    action = argv[0];
+    name = argv[1];
+    if (!knvr_config_get(config, name, &camera)) {
+        (void)fprintf(stderr, "kilix-nvr: no camera named '%s'\n", name);
+        return 1;
+    }
+    if (!zone_map_path(name, path, sizeof(path))) {
+        return 1;
+    }
+
+    if (strcmp(action, "paint") == 0) {
+        char frame[KNVR_PATH_MAX];
+        char directory[KNVR_PATH_MAX];
+        int width = 0;
+        int height = 0;
+
+        if (argc != 2) {
+            return usage(stderr);
+        }
+        if (!knvr_paths_subdir(directory, sizeof(directory), "zones") ||
+            snprintf(frame, sizeof(frame), "%s/%s-frame.ppm", directory,
+                     name) < 0) {
+            return 1;
+        }
+        if (!grab_frame(name, frame, &width, &height)) {
+            return 1;
+        }
+        (void)printf("painting %s over a %dx%d frame\n", path, width, height);
+        /* Handing over rather than shelling out: the editor owns the
+         * terminal from here, and a wrapper process sitting in the middle
+         * of a full-screen graphical program is a wrapper that breaks its
+         * input. */
+        (void)execlp("kilix-mask", "kilix-mask", "--image", frame, path,
+                     (char *)NULL);
+        (void)fprintf(stderr,
+                      "kilix-nvr: kilix-mask is not installed; run "
+                      "`kilix install kilix-mask`\n");
+        return 1;
+    }
+
+    if (strcmp(action, "remove") == 0) {
+        const char *reason = NULL;
+
+        if (argc != 3) {
+            return usage(stderr);
+        }
+        if (!knvr_zones_undefine(path, argv[2], &reason)) {
+            (void)fprintf(stderr, "kilix-nvr: %s\n",
+                          reason != NULL ? reason : "cannot remove that zone");
+            return 1;
+        }
+        (void)printf("%s: removed zone %s\n", name, argv[2]);
+        return 0;
+    }
+
+    if (strcmp(action, "add") == 0) {
+        const char *reason = NULL;
+        uint8_t region = 0u;
+        int inertia = 1;
+        int loiter = 0;
+        bool preclusive = false;
+        int width = 0;
+        int height = 0;
+        struct stat existing;
+
+        if (argc < 3) {
+            return usage(stderr);
+        }
+        for (int i = 3; i < argc; i++) {
+            if (strncmp(argv[i], "inertia=", 8) == 0) {
+                inertia = atoi(argv[i] + 8);
+            } else if (strncmp(argv[i], "loiter=", 7) == 0) {
+                loiter = atoi(argv[i] + 7);
+            } else if (strcmp(argv[i], "preclusive=yes") == 0) {
+                preclusive = true;
+            } else if (strcmp(argv[i], "preclusive=no") == 0) {
+                preclusive = false;
+            } else {
+                (void)fprintf(stderr, "kilix-nvr: %s: unknown zone setting\n",
+                              argv[i]);
+                return 1;
+            }
+        }
+        if (inertia < 1 || inertia > 1000 || loiter < 0 || loiter > 86400) {
+            (void)fprintf(stderr,
+                          "kilix-nvr: inertia is 1 to 1000, loiter 0 to "
+                          "86400\n");
+            return 1;
+        }
+        /* A new map has to be the size of what it describes, and only the
+         * camera can say what that is. */
+        if (stat(path, &existing) != 0 &&
+            !grab_frame(name, NULL, &width, &height)) {
+            return 1;
+        }
+        if (!knvr_zones_define(path, argv[2], width, height, inertia,
+                               preclusive, loiter, &region, &reason)) {
+            (void)fprintf(stderr, "kilix-nvr: %s\n",
+                          reason != NULL ? reason : "cannot add that zone");
+            return 1;
+        }
+        /* Attaching it too, because a zone map the camera does not read
+         * is the one mistake this command exists to prevent. */
+        if (camera.zones[0] == '\0') {
+            (void)snprintf(camera.zones, sizeof(camera.zones), "%s.png",
+                           name);
+            if (!knvr_config_put(config, &camera)) {
+                (void)fprintf(stderr,
+                              "kilix-nvr: zone added but %s could not be "
+                              "pointed at it\n", name);
+                return 1;
+            }
+        }
+        (void)printf("%s: zone %s is region %u; paint it with "
+                     "`kilix-nvr zone paint %s` and press %u\n", name,
+                     argv[2], region, name, region);
+        return 0;
+    }
+    return usage(stderr);
 }

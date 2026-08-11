@@ -13,6 +13,7 @@
  */
 
 #include "knvr_detect.h"
+#include "knvr_command.h"
 
 #include <errno.h>
 #include <poll.h>
@@ -24,6 +25,11 @@
 #include <unistd.h>
 
 #define ERROR_MAX 160
+
+/* Words the caller may give in the detector command, before --geometry
+ * and its value are appended.  A cap that truncated rather than refused
+ * would run a different command than the one asked for. */
+#define KNVR_DETECT_ARGV_MAX 13
 
 struct knvr_detector {
     pid_t child;
@@ -113,6 +119,9 @@ bool knvr_detector_start(
     knvr_detector **out, const knvr_detector_options *options)
 {
     static const char *const DEFAULT_ARGV[] = {"kilix-nvr-detect", NULL};
+    const char *env_argv[KNVR_DETECT_ARGV_MAX + 1];
+    char env_storage[512];
+    const char *const *chosen;
     knvr_detector_options defaults;
     knvr_detector *detector;
     int to_child[2];
@@ -126,6 +135,16 @@ bool knvr_detector_start(
     if (options == NULL) {
         knvr_detector_options_init(&defaults);
         options = &defaults;
+    }
+    chosen = options->argv;
+    if (chosen == NULL &&
+        knvr_command_from_env("KILIX_NVR_DETECT", env_storage,
+                              sizeof(env_storage), env_argv,
+                              KNVR_DETECT_ARGV_MAX + 1u)) {
+        chosen = env_argv;
+    }
+    if (chosen == NULL) {
+        chosen = DEFAULT_ARGV;
     }
     if (options->width <= 0 || options->height <= 0) {
         return false;
@@ -165,9 +184,8 @@ bool knvr_detector_start(
         return false;
     }
     if (detector->child == 0) {
-        const char *const *argv =
-            options->argv != NULL ? options->argv : DEFAULT_ARGV;
-        char *child_argv[8];
+        const char *const *argv = chosen;
+        char *child_argv[KNVR_DETECT_ARGV_MAX + 3];
         size_t count = 0u;
 
         (void)dup2(to_child[0], STDIN_FILENO);
@@ -177,7 +195,7 @@ bool knvr_detector_start(
         /* stderr is left alone: the detector's diagnostics are the
          * caller's business, and swallowing them makes a model that
          * failed to load indistinguishable from one that sees nothing. */
-        while (argv[count] != NULL && count < 5u) {
+        while (argv[count] != NULL && count < KNVR_DETECT_ARGV_MAX) {
             child_argv[count] = (char *)argv[count];
             count++;
         }

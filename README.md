@@ -9,11 +9,13 @@ protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/), using
 [`kilix-rtsp`](https://github.com/itsmygithubacct/kilix-rtsp) for acquisition
 and presentation.
 
-**Status: it works.** Cameras record, motion gates a detector, events are
-stored and reviewable, retention deletes. Built and verified against live
-cameras. What is not here yet: a trained sound-event model (the classifier
-process and its protocol are), and tracking and zones, which the design
-describes and nothing implements.
+**Status: it works.** Cameras record, motion gates a detector, detections
+become tracked objects, zones say where they were, sound events are heard,
+events are stored and reviewable, and retention deletes. Built and verified
+against live cameras. What is not here yet: per-class sound thresholds, and a
+positive control for six of the nine sound classes — see
+[`docs/SOUND-MODEL.md`](docs/SOUND-MODEL.md) for exactly what has and has not
+been measured.
 
 ```sh
 git submodule update --init --recursive
@@ -34,6 +36,7 @@ when you add the camera, and you can change any of them afterwards:
 | object classes | any COCO labels | person + animals |
 | audio record | on / off | off |
 | audio detection | on / off | off |
+| zone map | a kilix-mask file | — |
 | decode size | W×H | camera's substream |
 | container | `mkv` / `mp4` / `mov` | `mkv` |
 | retain days | days this camera keeps | — |
@@ -44,6 +47,47 @@ consuming disk without being asked for.
 Object detection implies motion detection, which is its gate. Motion detection
 on its own is a complete configuration — events for movement, without ever
 asking a model what caused it.
+
+## Tracking and zones
+
+**Detections become objects.** A detector answers "what is in this frame" and
+nothing else; ask it twice and you get two unrelated answers. Tracking is the
+missing noun — the same car, seen repeatedly, with a beginning and an end — and
+it is what turns "four hundred detections" into "three people and a car". Box
+overlap plus a centroid gate, matched within a class, no Kalman filter and no
+scipy: `kilix-nvr objects <event>` reads the result.
+
+A track that stops moving for thirty seconds is marked **parked**, because a
+car on the drive since Tuesday must stop being news.
+
+**Zones are painted, not typed.** A camera's zone map is a
+[kilix-mask](https://github.com/itsmygithubacct/kilix-mask) file: one named
+region per zone, painted over a frame from that camera. The painter, the file
+format, the names and the free-form attributes all already existed, and the map
+opens in any image viewer. The cost is that regions cannot overlap — a point is
+in exactly one zone or none.
+
+```sh
+kilix-nvr zone add   drivecam driveway inertia=3
+kilix-nvr zone add   drivecam road preclusive=yes
+kilix-nvr zone paint drivecam          # grabs a frame, hands over to kilix-mask
+kilix-nvr zones      drivecam
+kilix-nvr events --zone driveway
+```
+
+Policy rides in each region's attributes, so a zone map is self-describing:
+
+- `inertia=N` — frames inside before the object counts as having arrived.
+- `preclusive=yes` — activity here **suppresses** rather than raises, which is
+  ZoneMinder's term and its semantics. It applies at the motion gate, so a
+  preclusive zone costs no detector time at all. Suppressed regions are
+  counted and reported, because a suppression nobody can see is
+  indistinguishable from a camera that stopped working.
+- `loiter=SECONDS` — how long dwelling there becomes interesting by itself.
+
+The point tested is the middle of the box's bottom edge — where the thing
+touches the ground. A centroid puts a tall person in the zone their chest is
+over, which for a camera looking down a drive is routinely the wrong one.
 
 ## Design
 
@@ -57,6 +101,15 @@ system, and a second decode produces bytes that are already in memory. Cameras
 generally do tolerate concurrent sessions — two sustained readers on one camera
 were verified running for 14 hours — so `kilix-nvr` can coexist with another
 recorder. It simply never needs to.
+
+**It hears as well as sees.** Sound events are a second subprocess on the same
+480-byte contract, with its own ffmpeg pulling `-vn` audio: different models,
+different rates and different failure modes, and a wedged audio model must not
+stop a camera seeing. The model is YAMNet — Apache-2.0, 4 MB, 16 kHz mono,
+3.5 ms per second of audio — mapped from its 521 AudioSet classes onto nine
+worth reporting. It is fetched by hash rather than vendored:
+[`docs/SOUND-MODEL.md`](docs/SOUND-MODEL.md) is why that model and what it
+actually does on 8 kHz camera audio.
 
 **The model runs outside the core.** Object detection is a supervised subprocess
 speaking a fixed-size protocol on stdin/stdout — a tensor in, a
@@ -116,6 +169,9 @@ kilix-nvr review                    # review interface
 kilix-nvr play      <event|time>    # playback
 kilix-nvr reanalyze <event>         # re-run detection over stored footage
 kilix-nvr clip      <event>         # cut it out of the segments, -c copy
+kilix-nvr objects   <event>         # the things it was, not the frames
+kilix-nvr zones     <name>          # a camera's zones and what they do
+kilix-nvr zone      add|remove|paint <name> ...
 kilix-nvr prune                     # apply retention
 ```
 
@@ -130,6 +186,20 @@ configuration, not an invocation.
 A C11 compiler, POSIX, pthreads, and `sqlite3` at link time. At runtime: the
 `ffmpeg` binary and a detector command. No ML library is linked, and no
 accelerator runtime — those live behind the detector command, wherever it runs.
+
+**Where inference runs is an environment variable**, since it is a property of
+the host rather than of a camera:
+
+```sh
+KILIX_NVR_DETECT="ssh gpubox kilix-nvr-detect"
+KILIX_NVR_LISTEN="$HOME/.local/gpu_terminal/kilix-nvr/venv/bin/python \
+                  /usr/local/bin/kilix-nvr-listen"
+```
+
+Unset, each falls back to `kilix-nvr-detect` and `kilix-nvr-listen` on `PATH`,
+which `make install` puts there beside the binary. Both are split on spaces
+with no quoting: a path containing a space needs a wrapper script, which is a
+smaller surprise than half-implemented shell quoting.
 
 ## Configuration and data
 

@@ -171,6 +171,45 @@ typedef struct test_case {
     test_function function;
 } test_case;
 
+/*
+ * Where inference runs is a launch detail, and the environment is how it
+ * is said.  Proving it here rather than trusting the plumbing: a typo in
+ * this path degrades every camera to motion-only, silently.
+ */
+static bool test_the_command_can_come_from_the_environment(void)
+{
+    knvr_detector *detector = NULL;
+    knvr_detector_options options;
+    uint8_t *frame = calloc((size_t)W * H * 4u, 1u);
+    knvr_detection_box boxes[8];
+    size_t count = 0u;
+
+    CHECK(frame != NULL);
+    CHECK(setenv("KILIX_NVR_DETECT", "python3 tests/fake_detect.py", 1) == 0);
+    knvr_detector_options_init(&options);
+    options.width = W;
+    options.height = H;
+    options.timeout_seconds = 10;
+    CHECK(knvr_detector_start(&detector, &options));
+    CHECK(knvr_detector_run(detector, frame, boxes, 8u, &count));
+    CHECK(count == 1u && boxes[0].class_id == 0);
+    knvr_detector_stop(detector);
+
+    /* Nonsense in the variable must not become a truncated command: this
+     * one has more words than the cap, so the default is used instead -
+     * which is not installed here, so starting still works and detecting
+     * does not. */
+    CHECK(setenv("KILIX_NVR_DETECT",
+                 "a b c d e f g h i j k l m n o p q r s t", 1) == 0);
+    detector = NULL;
+    CHECK(knvr_detector_start(&detector, &options));
+    knvr_detector_stop(detector);
+
+    CHECK(unsetenv("KILIX_NVR_DETECT") == 0);
+    free(frame);
+    return true;
+}
+
 int
 main(void)
 {
@@ -180,7 +219,9 @@ main(void)
         {"the threshold applies", test_the_threshold_applies},
         {"a dead detector is survivable",
          test_a_dead_detector_is_survivable},
-        {"defaults and rejections", test_defaults_and_rejections}
+        {"defaults and rejections", test_defaults_and_rejections},
+        {"the command can come from the environment",
+         test_the_command_can_come_from_the_environment}
     };
     size_t passed = 0u;
 

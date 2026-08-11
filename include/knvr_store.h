@@ -26,6 +26,7 @@ extern "C" {
 #define KNVR_STORE_NAME_MAX 64
 #define KNVR_STORE_LABEL_MAX 32
 #define KNVR_STORE_PATH_MAX 512
+#define KNVR_STORE_ZONES_MAX 128
 
 typedef struct knvr_store knvr_store;
 
@@ -59,7 +60,40 @@ typedef struct knvr_detection {
     int y;
     int w;
     int h;
+    /* The tracked object this detection belongs to, or 0 when nothing was
+     * tracking - a sound event, or a detection from before tracking
+     * existed. */
+    int64_t track;
+    /* The zone it was standing in, or empty. */
+    char zone[KNVR_STORE_LABEL_MAX];
 } knvr_detection;
+
+/*
+ * A tracked object: one row for one thing that was there, however many
+ * frames it appeared in.
+ *
+ * `track` is the tracker's id, unique only within the run that produced
+ * it, so identity in the store is the (event, track) pair.
+ */
+typedef struct knvr_object {
+    int64_t id;
+    int64_t event;
+    int64_t track;
+    char camera[KNVR_STORE_NAME_MAX];
+    char label[KNVR_STORE_LABEL_MAX];
+    double score;
+    int64_t first_seen;
+    int64_t last_seen;
+    int travelled;      /* px the centroid covered */
+    bool stationary;
+    /*
+     * On write: the zone it is in now, or empty.  On read: every zone it
+     * has been in, comma-separated.  Asymmetric on purpose - the caller
+     * knows where the thing is, and only the store can know where it has
+     * been.
+     */
+    char zone[KNVR_STORE_ZONES_MAX];
+} knvr_object;
 
 /* ------------------------------- lifetime ------------------------------- */
 
@@ -99,6 +133,19 @@ bool knvr_store_close_stale(knvr_store *store, const char *camera,
 bool knvr_store_add_detection(
     knvr_store *store, const knvr_detection *detection);
 
+/*
+ * Record a tracked object, or update the one already recorded.
+ *
+ * Called on every frame the object is seen: the row is keyed on
+ * (event, track), the score only ever rises, and the zone is added to the
+ * list of zones it has been in rather than replacing it.
+ */
+bool knvr_store_put_object(knvr_store *store, const knvr_object *object);
+
+bool knvr_store_objects(
+    const knvr_store *store, int64_t event_id, knvr_object *out,
+    size_t capacity, size_t *count);
+
 /* A still, a clip or a segment belonging to an event.  `kind` is the
  * caller's word for it; the store does not interpret it. */
 bool knvr_store_add_media(
@@ -115,6 +162,9 @@ typedef struct knvr_query {
     char camera[KNVR_STORE_NAME_MAX];
     /* Only events whose best detection scored at least this. */
     double min_score;
+    /* Only events with an object that was in this zone.  Empty means any,
+     * and a name no zone has means none. */
+    char zone[KNVR_STORE_LABEL_MAX];
     /* 0 means the store's default. */
     int limit;
 } knvr_query;

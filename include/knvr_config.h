@@ -71,6 +71,15 @@ typedef struct knvr_camera {
     /* Mask painted with kilix-mask, or empty for none.  Relative to the
      * config directory, so a data directory stays movable. */
     char mask[KNVR_NAME_MAX * 2];
+
+    /*
+     * Zone map, also painted with kilix-mask, and a separate file from
+     * the mask on purpose: one says which pixels to ignore entirely and
+     * the other says what the pixels that matter are called.  Merging
+     * them would make "ignore the road" and "the road is a zone"
+     * impossible to express at once.
+     */
+    char zones[KNVR_NAME_MAX * 2];
 } knvr_camera;
 
 typedef struct knvr_config knvr_config;
