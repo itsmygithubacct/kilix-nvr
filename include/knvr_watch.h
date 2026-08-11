@@ -44,6 +44,17 @@ typedef struct knvr_watch_options {
 
     int fps_cap;
 
+    /*
+     * Difference frames at all.  Default true.
+     *
+     * A camera set `motion=off` is asking to be decoded and recorded and
+     * not watched, and that must actually cost nothing: differencing is
+     * ~6.5 ms per frame per camera, which is 45% of a core across seven
+     * of them.  With this false no detector is built, no boxes are ever
+     * reported, and `motion_fraction` stays zero.
+     */
+    bool motion;
+
     /* Mask file painted with kilix-mask, or NULL.  Its painted region is
      * what motion IGNORES - kmask_expand_exclude() already produces the
      * polarity kmd_detector_set_mask() wants, so neither side inverts. */

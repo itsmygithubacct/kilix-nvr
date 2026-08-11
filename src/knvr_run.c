@@ -196,6 +196,10 @@ static bool camera_start(camera_run *run, const knvr_camera *policy,
         return false;
     }
     knvr_watch_options_init(&run->options);
+    /* A camera told not to watch is decoded and recorded and not
+     * differenced, which is what makes `motion=off` cost something less
+     * than motion=on rather than exactly the same. */
+    run->options.motion = policy->motion;
     /* ffmpeg's stderr goes to a file, never the terminal: one warning in
      * the alternate screen corrupts a display, and a flaky camera
      * produces plenty. */

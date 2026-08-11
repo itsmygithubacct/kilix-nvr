@@ -80,6 +80,9 @@ typedef struct feed {
     knvr_ring sound_ring;
     kod_box boxes[KOD_BOX_MAX];
     size_t box_count;
+    /* An attached feed has no detector to test for, so whether boxes are
+     * wanted has to be its own answer. */
+    bool showing_boxes;
     uint8_t *frame;            /* the last frame, with overlays drawn */
     uint64_t seen;             /* frame counter at the last borrow */
     uint64_t frames;
@@ -240,14 +243,26 @@ static bool feed_start(feed *at, const char *name, bool listen)
             return false;
         }
     }
-    kmd_config_init(&motion_config);
-    motion_config.width = DECODE_W;
-    motion_config.height = DECODE_H;
-    motion_config.pixfmt = KMD_PIXFMT_BGRA;
-    motion_config.detect_height = MOTION_HEIGHT;
-    if (!kmd_detector_create(&at->motion, &motion_config)) {
-        feed_stop(at);
-        return false;
+    /*
+     * Attached to a recorder, this measures nothing.
+     *
+     * The recorder is already differencing this camera, classifying its
+     * sound and running a detector over what moved, and all three answers
+     * reach the store a moment later.  Measuring them again here is a
+     * second copy of every model on the machine - the mistake the runner
+     * had to un-make internally, and no better across two processes than
+     * it was across three cameras.
+     */
+    if (at->attached == NULL) {
+        kmd_config_init(&motion_config);
+        motion_config.width = DECODE_W;
+        motion_config.height = DECODE_H;
+        motion_config.pixfmt = KMD_PIXFMT_BGRA;
+        motion_config.detect_height = MOTION_HEIGHT;
+        if (!kmd_detector_create(&at->motion, &motion_config)) {
+            feed_stop(at);
+            return false;
+        }
     }
     at->frame = malloc((size_t)DECODE_W * (size_t)DECODE_H * 4u);
     if (at->frame == NULL ||
@@ -256,7 +271,7 @@ static bool feed_start(feed *at, const char *name, bool listen)
         feed_stop(at);
         return false;
     }
-    if (listen) {
+    if (listen && at->attached == NULL) {
         ksd_options_init(&sound_options);
         sound_options.min_score = 0.0f;   /* the view thresholds */
         if (knvr_paths_state_file(log_path, sizeof(log_path),
@@ -281,6 +296,16 @@ static void feed_detector(feed *at, bool wanted)
     kod_options options;
     char log_path[KNVR_PATH_MAX];
 
+    /* Attached: the recorder's detector is the detector, and its boxes
+     * arrive through the store.  `d` still toggles whether they are
+     * drawn, so the key does what it says either way. */
+    if (at->attached != NULL) {
+        at->showing_boxes = wanted;
+        if (!wanted) {
+            at->box_count = 0u;
+        }
+        return;
+    }
     if (wanted == (at->detector != NULL)) {
         return;
     }
@@ -296,6 +321,48 @@ static void feed_detector(feed *at, bool wanted)
         options.log_path = log_path;
     }
     (void)kod_open(&at->detector, &options);
+}
+
+/*
+ * The recorder's detections for this camera, as boxes.
+ *
+ * Stored by label rather than by class id - the store is meant to outlive
+ * any one model's numbering - so the name is mapped back through the same
+ * allowlist that produced it.  A label this build does not know is
+ * skipped rather than drawn in a default colour, because a box whose
+ * class is a guess is worse than no box.
+ */
+static void read_recent_boxes(feed *at, const knvr_store *store, int64_t now)
+{
+    knvr_detection recent[KOD_BOX_MAX];
+    size_t count = 0u;
+
+    at->box_count = 0u;
+    if (!at->showing_boxes) {
+        return;
+    }
+    /* Three seconds: long enough that a detection survives a couple of
+     * quiet frames, short enough that a car which has left stops being
+     * drawn over an empty drive. */
+    if (!knvr_store_recent_detections(store, at->name, now - 3, recent,
+                                      KOD_BOX_MAX, &count)) {
+        return;
+    }
+    for (size_t i = 0u; i < count && at->box_count < KOD_BOX_MAX; i++) {
+        const int class_id = kod_class_from_name(recent[i].label);
+
+        if (class_id < 0 || recent[i].w <= 0 || recent[i].h <= 0) {
+            continue;
+        }
+        at->boxes[at->box_count].class_id = class_id;
+        at->boxes[at->box_count].score = (float)recent[i].score;
+        at->boxes[at->box_count].at.x = recent[i].x;
+        at->boxes[at->box_count].at.y = recent[i].y;
+        at->boxes[at->box_count].at.w = recent[i].w;
+        at->boxes[at->box_count].at.h = recent[i].h;
+        at->boxes[at->box_count].region = -1;
+        at->box_count++;
+    }
 }
 
 /*
@@ -378,13 +445,36 @@ static bool feed_step(feed *at, knvr_store *store)
     at->online = true;
     (void)memcpy(at->frame, pixels,
                  (size_t)DECODE_W * (size_t)DECODE_H * 4u);
-    moved_count = kmd_detect(at->motion, pixels, motion,
-                             sizeof(motion) / sizeof(motion[0]), &result);
     if (at->attached != NULL) {
         krtsp_frame_release(at->attached);
-    } else {
-        krtsp_source_release(at->source);
+        /*
+         * Attached: the recorder measured all of this, so read it back
+         * once a second rather than deriving it again.  A query at 1 Hz
+         * against a local sqlite is nothing; a second motion detector,
+         * classifier and object detector per camera is not.
+         */
+        if (at->second == 0) {
+            at->second = now;
+        } else if (now != at->second) {
+            knvr_pulse pulse;
+
+            (void)memset(&pulse, 0, sizeof(pulse));
+            if (knvr_store_pulse_series(store, at->name, at->second, now,
+                                        &pulse, 1u)) {
+                knvr_ring_push(&at->motion_ring, pulse.motion);
+                knvr_ring_push(&at->sound_ring, pulse.audio);
+            } else {
+                knvr_ring_push(&at->motion_ring, 0.0f);
+                knvr_ring_push(&at->sound_ring, 0.0f);
+            }
+            at->second = now;
+            read_recent_boxes(at, store, now);
+        }
+        return true;
     }
+    moved_count = kmd_detect(at->motion, pixels, motion,
+                             sizeof(motion) / sizeof(motion[0]), &result);
+    krtsp_source_release(at->source);
 
     if (result.motion_fraction > at->motion_peak && !result.calibrating) {
         at->motion_peak = result.motion_fraction;
@@ -421,6 +511,24 @@ static bool feed_step(feed *at, knvr_store *store)
      * draw a person a different colour. */
     kod_draw_boxes(at->frame, DECODE_W, DECODE_H, at->boxes, at->box_count);
     return true;
+}
+
+/*
+ * Who shows boxes.
+ *
+ * A feed that owns its stream must load a model to answer, so only the
+ * one being watched does.  An attached feed only has to ask the store,
+ * which costs a query a second, so all of them can - and a grid where
+ * every camera shows what the recorder saw is the thing this was for.
+ */
+static void view_detect(view *state)
+{
+    for (size_t i = 0u; i < state->count; i++) {
+        if (state->feeds[i].attached != NULL) {
+            feed_detector(&state->feeds[i], state->detect);
+        }
+    }
+    feed_detector(&state->feeds[state->focus], state->detect);
 }
 
 /* -------------------------------- replay --------------------------------- */
@@ -1014,7 +1122,10 @@ static void compose(sr_canvas *canvas, view *state)
         (void)snprintf(line, sizeof(line), "%s%s%s", at->name,
                        at->attached != NULL ? "   recorder's frames"
                                             : "   own stream",
-                       at->detector != NULL ? "   detecting" : "");
+                       at->detector != NULL || (at->attached != NULL &&
+                                                at->showing_boxes)
+                           ? "   detecting"
+                           : "");
     }
     sr_text(canvas, 8.0f, 7.0f, line, TEXT, 1.0f, 1);
     sr_text(canvas,
@@ -1137,11 +1248,7 @@ int knvr_view(
                             "`kilix-nvr add <name>`\n");
         return 1;
     }
-    /* One detector, on what is being watched.  A grid of nine that each
-     * loaded a model would be a grid nobody could open. */
-    if (state.detect) {
-        feed_detector(&state.feeds[state.focus], true);
-    }
+    view_detect(&state);
 
     if (!headless) {
         kittyts_session_init(&session);
@@ -1309,18 +1416,18 @@ int knvr_view(
             if (key.key == '\t' || key.key == KITTYKB_KEY_RIGHT) {
                 feed_detector(&state.feeds[state.focus], false);
                 state.focus = (state.focus + 1u) % state.count;
-                feed_detector(&state.feeds[state.focus], state.detect);
+                view_detect(&state);
                 state.grid = false;
             } else if (key.key == KITTYKB_KEY_LEFT) {
                 feed_detector(&state.feeds[state.focus], false);
                 state.focus = (state.focus + state.count - 1u) % state.count;
-                feed_detector(&state.feeds[state.focus], state.detect);
+                view_detect(&state);
                 state.grid = false;
             } else if (key.key == 'g') {
                 state.grid = !state.grid;
             } else if (key.key == 'd') {
                 state.detect = !state.detect;
-                feed_detector(&state.feeds[state.focus], state.detect);
+                view_detect(&state);
             } else if (key.key == '\r' || key.key == 'r') {
                 /* Into the recording at the moment that was picked.  The
                  * live feeds keep running behind it: coming back out
