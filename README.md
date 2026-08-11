@@ -126,6 +126,13 @@ on the far side of the detector pipe. Accelerators are detected and optional,
 never assumed, and probed by running them rather than by reading a capability
 list, because a listed accelerator is not a working one.
 
+**Detection runs on crops around what moved**, not on whole frames — Frigate's
+shape, in [`kilix-object-detect`](https://github.com/itsmygithubacct/kilix-object-detect).
+A detector run on whole frames pays full price for every frame and sees a
+person forty pixels tall as forty pixels; run on crops, it pays for the crops
+and sees that person filling the frame it is given. It also means a preclusive
+zone costs no inference at all, because a crop is never taken from one.
+
 **Detection is gated behind motion.** Motion detection is cheap arithmetic on
 the luma plane of a frame that is already in memory; inference is milliseconds.
 Running the second only when the first finds something bounds the cost by how
@@ -191,7 +198,7 @@ accelerator runtime — those live behind the detector command, wherever it runs
 the host rather than of a camera:
 
 ```sh
-KILIX_NVR_DETECT="ssh gpubox kilix-nvr-detect"
+KILIX_OBJECT_DETECTOR="ssh gpubox kilix-look-detect"
 KILIX_SOUND_CLASSIFIER="$HOME/.venvs/audio/bin/python \
                         /usr/local/bin/kilix-listen-classify"
 ```
