@@ -8,6 +8,11 @@ AR ?= ar
 INSTALL ?= install
 
 CPPFLAGS += -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -Iinclude -Isrc
+# Header dependencies, generated as a side effect of compiling.  Without
+# them a changed header leaves stale objects linked against the values it
+# used to have, and the result is a test that fails for a reason nothing
+# in the source explains.  That has cost real time here more than once.
+DEPFLAGS := -MMD -MP
 WARNINGS := \
 	-Wall -Wextra -Wpedantic -Wconversion -Wshadow \
 	-Wstrict-prototypes -Wmissing-prototypes -Wformat=2
@@ -23,6 +28,7 @@ RTSP := third_party/kilix-rtsp
 MOTION := third_party/kilix-motion-detect
 MASK := third_party/kilix-mask
 KSD := third_party/kilix-sound-detect
+KOD := third_party/kilix-object-detect
 KTS := $(RTSP)/third_party/kitty-terminal-session
 KFB := $(KTS)/third_party/kitty-framebuffer
 KIN := $(KTS)/third_party/kitty-input
@@ -31,7 +37,7 @@ SR := $(RTSP)/third_party/soft-raster
 
 MODULE_CPPFLAGS := \
 	-I$(RTSP)/include -I$(MOTION)/include -I$(MASK)/include \
-	-I$(KSD)/include \
+	-I$(KSD)/include -I$(KOD)/include \
 	-I$(KTS)/include -I$(KFB)/include -I$(KIN)/include -I$(KKB)/include \
 	-I$(SR)/include
 
@@ -47,6 +53,7 @@ VENDOR_SOURCES := \
 	$(MOTION)/src/kilix_motion_detect.c \
 	$(MASK)/src/kilix_mask.c \
 	$(KSD)/src/kilix_sound_detect.c \
+	$(KOD)/src/kilix_object_detect.c \
 	$(KTS)/src/kitty_terminal_session.c \
 	$(KFB)/src/kitty_framebuffer.c \
 	$(KIN)/src/kitty_input.c \
@@ -62,7 +69,6 @@ OBJECTS := \
 	$(BUILD_DIR)/knvr_paths.o \
 	$(BUILD_DIR)/knvr_command.o \
 	$(BUILD_DIR)/knvr_config.o \
-	$(BUILD_DIR)/knvr_detect.o \
 	$(BUILD_DIR)/knvr_review.o \
 	$(BUILD_DIR)/knvr_sqlite.o \
 	$(BUILD_DIR)/knvr_store.o \
@@ -73,9 +79,9 @@ OBJECTS := \
 STATIC_LIB := $(BUILD_DIR)/lib$(PROJECT).a
 COMMAND := $(BUILD_DIR)/$(PROJECT)
 
-TESTS := $(BUILD_DIR)/test-config $(BUILD_DIR)/test-detect \
-	$(BUILD_DIR)/test-store $(BUILD_DIR)/test-track \
-	$(BUILD_DIR)/test-watch $(BUILD_DIR)/test-zone
+TESTS := $(BUILD_DIR)/test-config $(BUILD_DIR)/test-store \
+	$(BUILD_DIR)/test-track $(BUILD_DIR)/test-watch \
+	$(BUILD_DIR)/test-zone
 
 .DEFAULT_GOAL := all
 .PHONY: all test sanitize install clean
@@ -86,7 +92,7 @@ $(BUILD_DIR) $(BUILD_DIR)/vendor:
 	mkdir -p $@
 
 $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(MODULE_CPPFLAGS) $(CFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(MODULE_CPPFLAGS) $(DEPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(STATIC_LIB): $(OBJECTS)
 	$(AR) rcs $@ $^
@@ -129,15 +135,22 @@ sanitize: clean
 # command installed without it is a recorder that silently never detects.
 # The sound side's tools belong to kilix-sound-detect and are installed by
 # it, because two copies of a classifier is two things to keep in step.
-TOOLS := tools/kilix-nvr-detect
+TOOLS :=
+# The detector and the classifier belong to the modules that own them, and
+# are installed by them: two copies of a detector is two things to keep in
+# step.
+KSD_TOOLS := $(KSD)/tools/kilix-listen-classify \
+	$(KSD)/tools/kilix-sound-fetch-model \
+	$(KOD)/tools/kilix-look-detect
 KSD_TOOLS := $(KSD)/tools/kilix-listen-classify \
 	$(KSD)/tools/kilix-sound-fetch-model
 
 install: all
 	$(INSTALL) -d $(DESTDIR)$(PREFIX)/bin
 	$(INSTALL) -m 755 $(COMMAND) $(DESTDIR)$(PREFIX)/bin/
-	$(INSTALL) -m 755 $(TOOLS) $(DESTDIR)$(PREFIX)/bin/
 	$(INSTALL) -m 755 $(KSD_TOOLS) $(DESTDIR)$(PREFIX)/bin/
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+-include $(OBJECTS:.o=.d)

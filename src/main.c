@@ -531,7 +531,7 @@ static int command_watch(knvr_config *config, int argc, char **argv)
 {
     knvr_watch_options options;
     knvr_store *store = NULL;
-    knvr_detector *detector = NULL;
+    kod_detector *detector = NULL;
     ksd_listener *sound = NULL;
     knvr_tracker *tracker = NULL;
     knvr_zones *zones = NULL;
@@ -687,12 +687,14 @@ static int command_watch(knvr_config *config, int argc, char **argv)
     /* `always` runs it.  `on-view` is blind with no viewer attached, and
      * `cameras` is the one place that says so. */
     if (camera.detect == KNVR_DETECT_ALWAYS) {
-        knvr_detector_options detector_options;
+        kod_options detector_options;
 
-        knvr_detector_options_init(&detector_options);
-        detector_options.width = knvr_watch_width(watch);
-        detector_options.height = knvr_watch_height(watch);
-        if (!knvr_detector_start(&detector, &detector_options)) {
+        kod_options_init(&detector_options);
+        /* The square the model is fed, not the frame size: detection runs
+         * on crops around what moved, which is cheaper and better at
+         * anything small. */
+        detector_options.size = 320;
+        if (!kod_open(&detector, &detector_options)) {
             /* A degradation, not a fault: motion-only still records. */
             (void)fprintf(stderr,
                           "kilix-nvr: %s: no detector; motion only\n", name);
@@ -764,10 +766,38 @@ static int command_watch(knvr_config *config, int argc, char **argv)
              * 7-36 ms, differencing a downscaled frame is arithmetic. */
             if (detector != NULL) {
                 knvr_detection_box found[KNVR_DETECT_ROWS];
+                kod_box seen[KOD_BOX_MAX];
+                kod_rect crops[KOD_REGION_MAX];
+                kod_rect moved[KNVR_MOTION_BOX_MAX];
                 size_t detections = 0u;
+                size_t crop_count;
 
-                if (knvr_detector_run(detector, frame, found,
-                                      KNVR_DETECT_ROWS, &detections)) {
+                /*
+                 * Crops around what moved rather than the whole frame,
+                 * and the boxes handed in here have already been through
+                 * the preclusive-zone filter - so a zone marked as one to
+                 * ignore now costs no inference at all, instead of being
+                 * filtered after the model has already looked at it.
+                 */
+                for (size_t b = 0u; b < count && b < KNVR_MOTION_BOX_MAX;
+                     b++) {
+                    moved[b].x = boxes[b].x;
+                    moved[b].y = boxes[b].y;
+                    moved[b].w = boxes[b].w;
+                    moved[b].h = boxes[b].h;
+                }
+                crop_count = kod_regions(moved, count,
+                                         knvr_watch_width(watch),
+                                         knvr_watch_height(watch), 320,
+                                         crops, KOD_REGION_MAX, NULL);
+                if (kod_detect_regions(detector, frame,
+                                       knvr_watch_width(watch),
+                                       knvr_watch_height(watch), crops,
+                                       crop_count, seen, KOD_BOX_MAX,
+                                       &detections)) {
+                    for (size_t d = 0u; d < detections; d++) {
+                        found[d] = knvr_detect_from(&seen[d]);
+                    }
                     /* Zones are resolved per track rather than per
                      * detection, because inertia belongs to the object:
                      * "has been in the drive for three frames" is a fact
@@ -860,10 +890,10 @@ static int command_watch(knvr_config *config, int argc, char **argv)
                                    knvr_watch_width(watch),
                                    knvr_watch_height(watch));
                     }
-                } else if (knvr_detector_error(detector) != NULL) {
+                } else if (kod_error(detector) != NULL) {
                     (void)fprintf(stderr, "kilix-nvr: %s: %s\n", name,
-                                  knvr_detector_error(detector));
-                    knvr_detector_stop(detector);
+                                  kod_error(detector));
+                    kod_close(detector);
                     detector = NULL;
                 }
             }
@@ -977,7 +1007,7 @@ static int command_watch(knvr_config *config, int argc, char **argv)
                      suppressed == 1u ? "" : "s");
     }
     knvr_watch_stop(watch);
-    knvr_detector_stop(detector);
+    kod_close(detector);
     ksd_close(sound);
     knvr_tracker_free(tracker);
     knvr_zones_free(zones);
@@ -1347,10 +1377,10 @@ static int command_clip(int argc, char **argv)
 static int command_reanalyze(int argc, char **argv)
 {
     knvr_store *store = NULL;
-    knvr_detector *detector = NULL;
-    knvr_detector_options options;
+    kod_detector *detector = NULL;
+    kod_options options;
     knvr_media media[8];
-    knvr_detection_box found[KNVR_DETECT_ROWS];
+    kod_box seen[KOD_BOX_MAX];
     sr_canvas still;
     size_t media_count = 0u;
     size_t detections = 0u;
@@ -1383,10 +1413,12 @@ static int command_reanalyze(int argc, char **argv)
         knvr_store_close(store);
         return 1;
     }
-    knvr_detector_options_init(&options);
-    options.width = still.w;
-    options.height = still.h;
-    if (!knvr_detector_start(&detector, &options)) {
+    kod_options_init(&options);
+    /* A still has no motion to crop to, so the whole frame is the only
+     * honest thing to look at - and it is why this is worth doing at all:
+     * yesterday's frames get today's model. */
+    options.size = 320;
+    if (!kod_open(&detector, &options)) {
         (void)fprintf(stderr, "kilix-nvr: no detector\n");
         sr_canvas_free(&still);
         knvr_store_close(store);
@@ -1402,21 +1434,22 @@ static int command_reanalyze(int argc, char **argv)
             bgra[i * 4 + 2] = (uint8_t)((pixel >> 16) & 0xFFu);
             bgra[i * 4 + 3] = 0xFF;
         }
-        if (knvr_detector_run(detector, bgra, found, KNVR_DETECT_ROWS,
-                              &detections)) {
+        if (kod_detect(detector, bgra, still.w, still.h, seen, KOD_BOX_MAX,
+                       &detections)) {
             for (size_t d = 0u; d < detections; d++) {
+                const knvr_detection_box box = knvr_detect_from(&seen[d]);
                 knvr_detection record;
 
                 (void)memset(&record, 0, sizeof(record));
                 record.event = wanted;
                 record.at = (int64_t)time(NULL);
                 (void)snprintf(record.label, sizeof(record.label), "%s",
-                               knvr_detect_label(found[d].class_id));
-                record.score = (double)found[d].score;
-                record.x = found[d].x;
-                record.y = found[d].y;
-                record.w = found[d].w;
-                record.h = found[d].h;
+                               knvr_detect_label(box.class_id));
+                record.score = (double)box.score;
+                record.x = box.x;
+                record.y = box.y;
+                record.w = box.w;
+                record.h = box.h;
                 (void)knvr_store_add_detection(store, &record);
                 (void)printf("%s %.2f\n", record.label, record.score);
             }
@@ -1427,7 +1460,7 @@ static int command_reanalyze(int argc, char **argv)
         }
         free(bgra);
     }
-    knvr_detector_stop(detector);
+    kod_close(detector);
     sr_canvas_free(&still);
     knvr_store_close(store);
     return status;

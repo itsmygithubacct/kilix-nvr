@@ -229,26 +229,39 @@ static bool test_a_single_sighting_is_not_confirmed(void)
     return true;
 }
 
-/* More detections than slots must not evict what is already known. */
+/*
+ * A full tracker keeps what it knows.
+ *
+ * More detections than slots is the case that matters, and the newcomer
+ * is refused rather than a confirmed object evicted to make room for what
+ * may be a hallucination.  Spaced far enough apart that neither overlap
+ * nor the centroid gate joins them, so each really is its own object.
+ */
 static bool test_a_crowd_does_not_evict(void)
 {
     knvr_tracker *tracker = NULL;
-    knvr_detection_box seen[KNVR_DETECT_ROWS];
+    knvr_detection_box seen[KNVR_TRACK_MAX + 4];
+    const size_t crowd = sizeof(seen) / sizeof(seen[0]);
     int64_t first;
 
     CHECK(make(&tracker, 1));
-    for (size_t i = 0u; i < KNVR_DETECT_ROWS; i++) {
-        seen[i] = box(0, (int)i * 30, 100, 20, 40, 0.5f);
+    for (size_t i = 0u; i < crowd; i++) {
+        seen[i] = box(0, (int)i * 60, 100, 20, 40, 0.5f);
     }
-    CHECK(knvr_tracker_update(tracker, seen, KNVR_DETECT_ROWS, 1000));
+    CHECK(knvr_tracker_update(tracker, seen, crowd, 1000));
     first = knvr_tracker_assigned(tracker, 0u);
-    CHECK(knvr_tracker_count(tracker) == KNVR_DETECT_ROWS);
+    CHECK(first != 0);
+    /* Every slot, and not one more. */
+    CHECK(knvr_tracker_count(tracker) == KNVR_TRACK_MAX);
     for (int round = 0; round < 3; round++) {
-        CHECK(knvr_tracker_update(tracker, seen, KNVR_DETECT_ROWS,
+        CHECK(knvr_tracker_update(tracker, seen, crowd,
                                   1200 + round * 200));
         CHECK(knvr_tracker_assigned(tracker, 0u) == first);
+        CHECK(knvr_tracker_count(tracker) == KNVR_TRACK_MAX);
     }
-    CHECK(knvr_tracker_count(tracker) <= KNVR_TRACK_MAX);
+    /* The ones that did not fit were never tracked, rather than tracked
+     * and then quietly dropped. */
+    CHECK(knvr_tracker_total(tracker) == KNVR_TRACK_MAX);
     knvr_tracker_free(tracker);
     return true;
 }
