@@ -3,7 +3,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 bool knvr_command_from_env(
     const char *variable, char *storage, size_t storage_size,
@@ -53,39 +52,4 @@ bool knvr_command_from_env(
     }
     argv[count] = NULL;
     return true;
-}
-
-void knvr_command_bundled(const char *name, char *out, size_t size)
-{
-    char self[1024];
-    ssize_t length;
-
-    if (name == NULL || out == NULL || size == 0u) {
-        return;
-    }
-    (void)snprintf(out, size, "%s", name);
-    length = readlink("/proc/self/exe", self, sizeof(self) - 1u);
-    if (length <= 0) {
-        return;
-    }
-    self[length] = '\0';
-    {
-        char *slash = strrchr(self, '/');
-        char beside[1200];
-        char in_tools[1200];
-
-        if (slash == NULL) {
-            return;
-        }
-        *slash = '\0';
-        /* Installed beside the binary, then the checkout's tools/. */
-        (void)snprintf(beside, sizeof(beside), "%s/%s", self, name);
-        (void)snprintf(in_tools, sizeof(in_tools), "%s/../tools/%s", self,
-                       name);
-        if (access(beside, X_OK) == 0 && strlen(beside) < size) {
-            (void)snprintf(out, size, "%s", beside);
-        } else if (access(in_tools, X_OK) == 0 && strlen(in_tools) < size) {
-            (void)snprintf(out, size, "%s", in_tools);
-        }
-    }
 }

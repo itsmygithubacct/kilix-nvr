@@ -19,6 +19,8 @@
  * quoting that works until it does not.
  */
 
+#include "kilix_sound_detect.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -33,17 +35,8 @@ bool knvr_command_from_env(
     const char **argv, size_t capacity);
 
 /*
- * Where a bundled tool is, preferring one that travels with this binary.
- *
- * `make install` puts the tools beside the command, but the catalog
- * installs a checkout and runs `build/kilix-nvr` in place, where nothing
- * is on PATH at all.  Looking next to the executable first, then in the
- * checkout's tools/, then falling back to a bare name for PATH, means the
- * detector is found however the program was installed - and "no detector;
- * motion only" then means the model is missing rather than the script.
- *
- * Always writes something: the bare name when nothing better is found.
+ * Finding a bundled tool is kilix-sound-detect's ksd_bundled_tool(): one
+ * implementation of "beside the executable, then the checkout's tools/,
+ * then PATH", not two that drift.
  */
-void knvr_command_bundled(const char *name, char *out, size_t size);
-
 #endif /* KNVR_COMMAND_H */

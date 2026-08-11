@@ -137,7 +137,7 @@ bool knvr_detector_start(
         knvr_detector_options_init(&defaults);
         options = &defaults;
     }
-    knvr_command_bundled("kilix-nvr-detect", bundled, sizeof(bundled));
+    ksd_bundled_tool("kilix-nvr-detect", bundled, sizeof(bundled));
     default_argv[0] = bundled;
     chosen = options->argv;
     if (chosen == NULL &&
