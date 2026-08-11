@@ -273,12 +273,16 @@ bool knvr_watch_step(
     watch->borrowed = true;
     watch->stats.frames++;
     watch->stats.last_age_ms = age_ms;
+    watch->stats.motion_fraction = 0.0f;
     if (rgba != NULL) {
         *rgba = frame;
     }
 
     written = kmd_detect(watch->detector, frame, found, KNVR_MOTION_BOX_MAX,
                          &result);
+    if (!result.calibrating) {
+        watch->stats.motion_fraction = result.motion_fraction;
+    }
     /* While the background model is converging its boxes are noise, and
      * acting on them produces a burst of false motion at every startup
      * and every reconnect. */

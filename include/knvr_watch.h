@@ -81,6 +81,16 @@ typedef struct knvr_watch_stats {
                               * keeps one available forever, so this is the
                               * only thing that distinguishes it from a
                               * still scene */
+    /*
+     * What fraction of the last frame changed, 0-1.
+     *
+     * Reported because it is already computed and is the only cheap
+     * measure of how busy a camera is: boxes say where, this says how
+     * much, and a recorder keeping one number a second wants this one.
+     * Zero while the background model is still calibrating, since a
+     * number from an unconverged model is worse than none.
+     */
+    float motion_fraction;
 } knvr_watch_stats;
 
 void knvr_watch_options_init(knvr_watch_options *options);
