@@ -67,6 +67,7 @@ VENDOR_LDLIBS := -lz
 
 OBJECTS := \
 	$(BUILD_DIR)/knvr_paths.o \
+	$(BUILD_DIR)/knvr_clip.o \
 	$(BUILD_DIR)/knvr_command.o \
 	$(BUILD_DIR)/knvr_config.o \
 	$(BUILD_DIR)/knvr_review.o \
@@ -83,7 +84,8 @@ OBJECTS := \
 STATIC_LIB := $(BUILD_DIR)/lib$(PROJECT).a
 COMMAND := $(BUILD_DIR)/$(PROJECT)
 
-TESTS := $(BUILD_DIR)/test-config $(BUILD_DIR)/test-store \
+TESTS := $(BUILD_DIR)/test-clip $(BUILD_DIR)/test-config \
+	$(BUILD_DIR)/test-store \
 	$(BUILD_DIR)/test-run $(BUILD_DIR)/test-track \
 	$(BUILD_DIR)/test-watch \
 	$(BUILD_DIR)/test-zone

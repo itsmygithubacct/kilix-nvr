@@ -143,6 +143,12 @@ typedef struct view {
     size_t event_picked;
     time_t events_read;
     bool detect;
+    /* Where the pointer is, and whether it has ever been anywhere: at
+     * startup there is no position to draw, and drawing an arrow in the
+     * corner nobody put there is worse than none. */
+    int mouse_x;
+    int mouse_y;
+    bool mouse_seen;
     replay back;
 } view;
 
@@ -885,6 +891,49 @@ static void draw_labels(sr_canvas *canvas, const feed *at, int x, int y,
     }
 }
 
+/*
+ * The pointer.
+ *
+ * Drawn rather than left to the terminal, which is not a preference: kitty
+ * hides its own pointer a few seconds after it stops moving, and in a
+ * full-screen picture that reads as a program with no cursor at all.  A
+ * viewer whose day strip can be dragged has to show what is doing the
+ * dragging.
+ *
+ * The same arrow kilix-cap draws, for the same reason and to the same
+ * shape - black outline, white fill, so it is visible over a bright sky
+ * and a dark drive alike, which a single-colour pointer is not.
+ */
+static const char *const POINTER[] = {
+    "#       ",
+    "##      ",
+    "#.#     ",
+    "#..#    ",
+    "#...#   ",
+    "#....#  ",
+    "#.....# ",
+    "#......#",
+    "#...####",
+    "#..#    ",
+    "#.#     ",
+    "##      "
+};
+
+static void draw_pointer(sr_canvas *canvas, int x, int y)
+{
+    for (size_t row = 0u; row < sizeof(POINTER) / sizeof(POINTER[0]); row++) {
+        const char *bits = POINTER[row];
+
+        for (int column = 0; bits[column] != '\0'; column++) {
+            if (bits[column] == '#') {
+                sr_px(canvas, x + column, y + (int)row, 0x00000000u);
+            } else if (bits[column] == '.') {
+                sr_px(canvas, x + column, y + (int)row, 0x00FFFFFFu);
+            }
+        }
+    }
+}
+
 static void draw_picture(sr_canvas *canvas, const feed *at, int x, int y,
                          int width, int height)
 {
@@ -1097,12 +1146,28 @@ static void compose_replay(sr_canvas *canvas, view *state)
                 height - 40);
 }
 
+static void compose_live(sr_canvas *canvas, view *state);
+
+/*
+ * Everything, in the order it stacks.
+ *
+ * The pointer goes on last and over both modes: it is the one thing that
+ * must never be behind what it is pointing at.
+ */
 static void compose(sr_canvas *canvas, view *state)
 {
     if (state->back.active) {
         compose_replay(canvas, state);
-        return;
+    } else {
+        compose_live(canvas, state);
     }
+    if (state->mouse_seen) {
+        draw_pointer(canvas, state->mouse_x, state->mouse_y);
+    }
+}
+
+static void compose_live(sr_canvas *canvas, view *state)
+{
     char line[256];
     const int width = canvas->w;
     const int height = canvas->h;
@@ -1361,6 +1426,17 @@ int knvr_view(
         while (kittyts_next_event(&session, &event)) {
             if (event.kind == KITTYIN_EVENT_MOUSE) {
                 const kittyin_mouse_event *mouse = &event.data.mouse;
+
+                /* Where it is, whatever it is over and whatever it is
+                 * doing: the arrow has to follow the hand even when the
+                 * hand is not on anything that responds. */
+                if (mouse->x != state.mouse_x || mouse->y != state.mouse_y ||
+                    !state.mouse_seen) {
+                    state.mouse_x = mouse->x;
+                    state.mouse_y = mouse->y;
+                    state.mouse_seen = true;
+                    last_draw = 0;
+                }
 
                 /* A press or a drag on the day seeks to where it points.
                  * The geometry comes from the drawing rather than being

@@ -15,6 +15,7 @@
 
 #include "knvr_run.h"
 
+#include "knvr_clip.h"
 #include "knvr_detect.h"
 #include "knvr_paths.h"
 #include "knvr_store.h"
@@ -35,8 +36,21 @@
 #include <unistd.h>
 
 #define QUIET_SECONDS 5
+/* A dropped audio stream is retried after this long, doubling to the
+ * maximum: short enough that an infrared switch costs seconds of sound,
+ * long enough that a camera with none costs nothing to keep asking. */
+#define SOUND_RETRY_MIN 5
+#define SOUND_RETRY_MAX 300
 #define CROP_SIZE 320
 #define RING_READERS 4
+/* Events waiting to be cut.  Deep enough for a burst, shallow enough that
+ * a camera which cannot keep up says so instead of growing. */
+#define CLIP_QUEUE_MAX 8
+/* How long to wait for the segment holding an event to rotate before
+ * cutting anyway.  Longer than a segment, so the ordinary case is always
+ * the clean one; short enough that a camera which stops does not hold its
+ * last event unclipped. */
+#define CLIP_PATIENCE_SECONDS 150
 
 /*
  * Set by a signal and read by the loop.
@@ -70,6 +84,22 @@ typedef struct camera_run {
      */
     bool detects;
     /*
+     * The listener is restarted rather than stood down for good.
+     *
+     * A camera that drops its audio stream for a minute - which these do,
+     * nightly, when they switch to infrared - used to cost sound for the
+     * life of the process, and the recorder is now a service that runs
+     * for weeks.  Backoff doubles from 5 seconds to five minutes so a
+     * camera with genuinely no audio is asked twelve times an hour rather
+     * than fifty times a second.
+     */
+    bool wants_sound;
+    /* Detection only while a viewer is attached to this camera's ring. */
+    bool on_view;
+    time_t sound_retry_at;
+    int sound_backoff;
+    uint32_t sound_restarts;
+    /*
      * The frame whose crops are with the model, and when it was taken.
      *
      * A copy, because the answer comes back several frames later and the
@@ -98,6 +128,24 @@ typedef struct camera_run {
     float sound_peak;
     bool still_saved;
     bool rendered;
+
+    /*
+     * A clip being cut, and the events waiting their turn.
+     *
+     * Started rather than waited for, the same reason the detector is:
+     * ffmpeg copying a minute of video takes a few hundred milliseconds,
+     * and spending those inside the frame loop would stall every camera -
+     * which is precisely the mistake this loop already had to un-make
+     * once.  One at a time per camera, because a queue that grows is a
+     * queue that never drains on a busy driveway.
+     */
+    pid_t clipper;
+    int64_t clip_event;
+    char clip_path[KNVR_PATH_MAX];
+    int64_t clip_queue[CLIP_QUEUE_MAX];
+    size_t clip_queued;
+    uint32_t clips_cut;
+    uint32_t clips_dropped;
 
     /* Held for the lifetime of the watch: knvr_watch_options keeps the
      * pointers rather than copying them. */
@@ -169,6 +217,40 @@ static bool resolve_url(const char *name, bool prefer_sub, char *out,
     return found;
 }
 
+/*
+ * The camera's audio, as a listener.
+ *
+ * One function for the first attempt and every retry, because a listener
+ * started two different ways is two things to keep in step - and the
+ * retry path is the one that runs for weeks.
+ */
+static bool start_listener(camera_run *run)
+{
+    ksd_options sound_options;
+    char sound_url[KRTSP_URL_MAX];
+
+    if (run->sound != NULL) {
+        return true;
+    }
+    ksd_options_init(&sound_options);
+    /* Its own log.  Two ffmpegs sharing one file makes "which of them is
+     * complaining" a guess. */
+    if (knvr_paths_state_file(run->sound_log, sizeof(run->sound_log),
+                              "ffmpeg-audio.log")) {
+        sound_options.log_path = run->sound_log;
+    }
+    if (knvr_paths_state_file(run->classify_log, sizeof(run->classify_log),
+                              "classify.log")) {
+        sound_options.classifier_log_path = run->classify_log;
+    }
+    /* The main stream, which is where the audio is: substreams frequently
+     * carry none at all. */
+    if (!resolve_url(run->name, false, sound_url, sizeof(sound_url))) {
+        return false;
+    }
+    return ksd_open(&run->sound, sound_url, &sound_options);
+}
+
 static void camera_stop(camera_run *run)
 {
     knvr_watch_stop(run->watch);
@@ -207,7 +289,12 @@ static bool camera_start(camera_run *run, const knvr_camera *policy,
                               "ffmpeg.log")) {
         run->options.log_path = run->log_path;
     }
-    if (policy->record == KNVR_RECORD_CONTINUOUS) {
+    /* `clips` captures continuously as well: pre-roll cannot be invented
+     * after the fact, so the ten seconds before an event exist only if
+     * something was already recording.  What differs is retention - the
+     * segments go early and the clips keep the camera's days. */
+    if (policy->record == KNVR_RECORD_CONTINUOUS ||
+        policy->record == KNVR_RECORD_CLIPS) {
         char segments[KNVR_PATH_MAX];
 
         /* The main stream for the archive, the substream for motion:
@@ -278,34 +365,18 @@ static bool camera_start(camera_run *run, const knvr_camera *policy,
                           "zones\n", run->name);
         }
     }
-    if (policy->sound_events) {
-        ksd_options sound_options;
-        char sound_url[KRTSP_URL_MAX];
-
-        ksd_options_init(&sound_options);
-        /* Its own log.  Two ffmpegs sharing one file makes "which of them
-         * is complaining" a guess. */
-        if (knvr_paths_state_file(run->sound_log, sizeof(run->sound_log),
-                                  "ffmpeg-audio.log")) {
-            sound_options.log_path = run->sound_log;
-        }
-        if (knvr_paths_state_file(run->classify_log,
-                                  sizeof(run->classify_log),
-                                  "classify.log")) {
-            sound_options.classifier_log_path = run->classify_log;
-        }
-        /* The main stream, which is where the audio is: substreams
-         * frequently carry none at all. */
-        if (resolve_url(run->name, false, sound_url, sizeof(sound_url)) &&
-            !ksd_open(&run->sound, sound_url, &sound_options)) {
-            (void)fprintf(stderr, "kilix-nvr: %s: no listener; sight only\n",
-                          run->name);
-        }
+    run->wants_sound = policy->sound_events;
+    if (run->wants_sound && !start_listener(run)) {
+        (void)fprintf(stderr, "kilix-nvr: %s: no listener yet; retrying\n",
+                      run->name);
     }
-    /* `always` runs it.  `on-view` is blind with no viewer attached, and
-     * `cameras` is the one place that says so.  The detector itself is
-     * opened once for the whole run, not here. */
+    /*
+     * `always` runs it.  `on-view` waits for a viewer to attach to this
+     * camera's ring, which is the promise the name makes and the runner
+     * could not keep until the ring could say who was reading it.
+     */
     run->detects = policy->detect == KNVR_DETECT_ALWAYS;
+    run->on_view = policy->detect == KNVR_DETECT_ON_VIEW;
     if (options->publish) {
         char ring[KNVR_NAME_MAX + 32];
 
@@ -402,6 +473,30 @@ static int64_t monotonic_ms(void)
 }
 
 /*
+ * Whether this camera's crops should go to the model right now.
+ *
+ * `always` is unconditional.  `on-view` asks the camera's own ring how
+ * many processes are attached to it, which is the whole point of the
+ * policy: a camera nobody is looking at costs decoding and differencing
+ * and no inference at all.  Answerable only since the ring learned to
+ * count attachment rather than borrows - before that the recorder had to
+ * treat on-view as off, which made the setting a lie.
+ *
+ * A camera with publishing turned off has no ring and therefore no
+ * viewer, so on-view means off there, which is the truthful reading.
+ */
+static bool camera_detects(const camera_run *run)
+{
+    if (run->detects) {
+        return true;
+    }
+    if (!run->on_view || run->ring == NULL) {
+        return false;
+    }
+    return krtsp_frame_readers(run->ring) > 0u;
+}
+
+/*
  * Ask, without waiting for the answer.
  *
  * The crops go out and the loop carries on decoding; the reply is picked
@@ -418,7 +513,7 @@ static bool offer_detections(camera_run *run, kod_detector *detector,
     kod_rect moved[KNVR_MOTION_BOX_MAX];
     size_t crop_count;
 
-    if (!run->detects || detector == NULL || run->offered == NULL) {
+    if (!camera_detects(run) || detector == NULL || run->offered == NULL) {
         return false;
     }
     /* Crops around what moved, and the boxes handed in here have already
@@ -579,20 +674,50 @@ static void listen(camera_run *run, knvr_store *store, bool verbose)
     size_t count = 0u;
 
     if (run->sound == NULL) {
+        if (!run->wants_sound || time(NULL) < run->sound_retry_at) {
+            return;
+        }
+        if (!start_listener(run)) {
+            run->sound_backoff = run->sound_backoff > 0
+                                     ? run->sound_backoff * 2
+                                     : SOUND_RETRY_MIN;
+            if (run->sound_backoff > SOUND_RETRY_MAX) {
+                run->sound_backoff = SOUND_RETRY_MAX;
+            }
+            run->sound_retry_at = time(NULL) + run->sound_backoff;
+            run->sound_restarts++;
+            return;
+        }
+        if (run->sound_restarts > 0u && verbose) {
+            (void)printf("  %s: listening again\n", run->name);
+        }
         return;
     }
     if (!ksd_step(run->sound, heard, 8u, &count)) {
         if (ksd_error(run->sound) != NULL) {
-            /* Once, then sight-only.  A camera with no audio reaches here
-             * immediately, and repeating it every second would bury
-             * everything else. */
-            (void)fprintf(stderr, "kilix-nvr: %s: %s; sight only\n",
-                          run->name, ksd_error(run->sound));
+            /* Said once per outage, not once per attempt: a camera with
+             * no audio at all would otherwise write a line every five
+             * seconds for a week. */
+            if (run->sound_restarts == 0u) {
+                (void)fprintf(stderr, "kilix-nvr: %s: %s; retrying\n",
+                              run->name, ksd_error(run->sound));
+            }
             ksd_close(run->sound);
             run->sound = NULL;
+            run->sound_backoff = run->sound_backoff > 0
+                                     ? run->sound_backoff * 2
+                                     : SOUND_RETRY_MIN;
+            if (run->sound_backoff > SOUND_RETRY_MAX) {
+                run->sound_backoff = SOUND_RETRY_MAX;
+            }
+            run->sound_retry_at = time(NULL) + run->sound_backoff;
+            run->sound_restarts++;
         }
         return;
     }
+    /* It answered, so whatever was wrong is over and the next outage
+     * starts from the short delay again. */
+    run->sound_backoff = 0;
     if (ksd_level(run->sound) > run->sound_peak) {
         run->sound_peak = ksd_level(run->sound);
     }
@@ -622,6 +747,75 @@ static void listen(camera_run *run, knvr_store *store, bool verbose)
     }
 }
 
+/*
+ * Move the clip queue along by one step, without waiting for anything.
+ *
+ * Collect first, then start: a cut that finished this iteration frees the
+ * slot for the next one in the same pass, so a queue of two events does
+ * not take two spare iterations to drain.
+ */
+static void clips_step(camera_run *run, knvr_store *store, bool verbose)
+{
+    knvr_query query;
+    knvr_event events[16];
+    size_t count = 0u;
+
+    if (run->clipper > 0) {
+        bool ok = false;
+
+        if (!knvr_clip_finish(store, run->clipper, run->clip_event,
+                              run->clip_path, &ok)) {
+            return;
+        }
+        run->clipper = 0;
+        if (ok) {
+            run->clips_cut++;
+            if (verbose) {
+                (void)printf("  %s: clip %s\n", run->name, run->clip_path);
+            }
+        }
+    }
+    if (run->clip_queued == 0u) {
+        return;
+    }
+    /*
+     * The event is re-read rather than remembered, because its end time
+     * is written when it closes and the clip's length comes from that.
+     * Asking the store is one query per event, against the answer it
+     * already holds.
+     */
+    knvr_query_init(&query);
+    query.limit = 16;
+    (void)snprintf(query.camera, sizeof(query.camera), "%.*s",
+                   (int)sizeof(query.camera) - 1, run->name);
+    if (knvr_store_events(store, &query, events, 16u, &count)) {
+        for (size_t i = 0u; i < count && i < 16u; i++) {
+            if (events[i].id != run->clip_queue[0]) {
+                continue;
+            }
+            /* Held back until the segment holding it has rotated: cutting
+             * from a file ffmpeg still has open gives a clip whose last
+             * seconds - the ones anybody watches - are whatever happened
+             * to be flushed. */
+            if (!knvr_clip_ready(&events[i], (int64_t)time(NULL),
+                                 CLIP_PATIENCE_SECONDS)) {
+                return;
+            }
+            run->clipper = knvr_clip_start(&events[i], run->clip_path,
+                                           sizeof(run->clip_path));
+            run->clip_event = events[i].id;
+            break;
+        }
+    }
+    /* Dropped from the queue either way: an event whose footage is gone
+     * is not going to acquire some, and retrying it every iteration would
+     * block everything behind it for ever. */
+    for (size_t i = 1u; i < run->clip_queued; i++) {
+        run->clip_queue[i - 1u] = run->clip_queue[i];
+    }
+    run->clip_queued--;
+}
+
 static void camera_step(camera_run *run, kod_detector *detector,
                         knvr_store *store, const knvr_run_options *options,
                         bool *offered)
@@ -633,6 +827,7 @@ static void camera_step(camera_run *run, kod_detector *detector,
     const int64_t now = (int64_t)time(NULL);
 
     listen(run, store, options->verbose);
+    clips_step(run, store, options->verbose);
     if (run->watch == NULL) {
         return;
     }
@@ -749,6 +944,16 @@ static void camera_step(camera_run *run, kod_detector *detector,
             (void)printf("  %s: event %lld closed\n", run->name,
                          (long long)run->event_id);
         }
+        /* Queued now, cut later: the segment holding it has to be on disk
+         * before there is anything to copy, and it is - the segmenter is
+         * a separate ffmpeg that has been writing all along. */
+        if (run->policy.record == KNVR_RECORD_CLIPS) {
+            if (run->clip_queued < CLIP_QUEUE_MAX) {
+                run->clip_queue[run->clip_queued++] = run->event_id;
+            } else {
+                run->clips_dropped++;
+            }
+        }
         run->event_id = 0;
     }
 }
@@ -818,7 +1023,10 @@ int knvr_run(knvr_config *config, const knvr_run_options *options)
                          knvr_watch_height(runs[count].watch),
                          runs[count].options.mask_path != NULL ? " masked" : "",
                          runs[count].zones != NULL ? " zoned" : "",
-                         runs[count].detects ? " detecting" : "",
+                         runs[count].detects
+                             ? " detecting"
+                             : (runs[count].on_view ? " detecting on view"
+                                                    : ""),
                          runs[count].ring != NULL ? " published" : "");
             count++;
         }
@@ -841,7 +1049,11 @@ int knvr_run(knvr_config *config, const knvr_run_options *options)
         kod_options detector_options;
         char detect_log[KNVR_PATH_MAX];
 
-        if (!runs[i].detects) {
+        /* Opened when any camera could ever want it, including an
+         * on-view one nobody is watching yet: loading the model takes
+         * ninety seconds, and doing that only when a viewer appears would
+         * mean the first minute and a half of watching sees nothing. */
+        if (!runs[i].detects && !runs[i].on_view) {
             continue;
         }
         kod_options_init(&detector_options);

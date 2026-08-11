@@ -418,29 +418,11 @@ bool knvr_camera_set(
                                   (knvr_record_mode)mode)) != 0) {
                 continue;
             }
-            /*
-             * `clips` is a name with nothing behind it.
-             *
-             * It is still spelled by knvr_record_mode_name(), because a
-             * store written before this check can hold it and a camera
-             * has to be describable.  What it must not be is settable:
-             * accepting it meant a camera reporting a recording mode it
-             * did not have, which behaved exactly like `stills` while
-             * claiming otherwise.  Refusing is the honest state until
-             * event clips are actually cut.
-             */
-            if (mode == KNVR_RECORD_CLIPS) {
-                if (reason != NULL) {
-                    *reason = "clips is not implemented; use continuous and "
-                              "cut events with `kilix-nvr clip`";
-                }
-                return false;
-            }
             camera->record = (knvr_record_mode)mode;
             return true;
         }
         if (reason != NULL) {
-            *reason = "record is off, stills or continuous";
+            *reason = "record is off, stills, clips or continuous";
         }
         return false;
     }

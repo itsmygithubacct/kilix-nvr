@@ -7,6 +7,7 @@
  * and `run` honours it.
  */
 
+#include "knvr_clip.h"
 #include "knvr_config.h"
 #include "knvr_detect.h"
 #include "knvr_paths.h"
@@ -693,6 +694,7 @@ static int command_prune(knvr_config *config, int argc, char **argv)
     knvr_prune_result result;
     size_t count = 0u;
     size_t events_removed = 0u;
+    size_t segments_removed = 0u;
     uint64_t bytes_freed = 0u;
     uint64_t cap_bytes = 0u;
     bool dry_run = false;
@@ -737,9 +739,26 @@ static int command_prune(knvr_config *config, int argc, char **argv)
         events_removed += result.events_removed;
         bytes_freed += result.bytes_freed;
     }
-    (void)printf("%s %zu event%s, %.1f MB\n",
+    /*
+     * The segments, which nothing used to touch.
+     *
+     * They are written by ffmpeg without telling the store, so no media
+     * row ever referred to them and no retention rule ever reached them:
+     * a camera on `continuous` filled the disk while this command
+     * reported success.  Counted separately from events, because a
+     * segment is not an event and adding them together would make both
+     * numbers meaningless.
+     */
+    (void)memset(&result, 0, sizeof(result));
+    if (knvr_clip_prune_segments(config, (int64_t)time(NULL), dry_run,
+                                 &result)) {
+        segments_removed = result.media_removed;
+        bytes_freed += result.bytes_freed;
+    }
+    (void)printf("%s %zu event%s and %zu segment%s, %.1f MB\n",
                  dry_run ? "would remove" : "removed", events_removed,
-                 events_removed == 1u ? "" : "s",
+                 events_removed == 1u ? "" : "s", segments_removed,
+                 segments_removed == 1u ? "" : "s",
                  (double)bytes_freed / (1024.0 * 1024.0));
     knvr_store_close(store);
     return 0;
@@ -874,11 +893,9 @@ static int command_clip(int argc, char **argv)
     knvr_store *store = NULL;
     knvr_query query;
     knvr_event events[64];
+    char output[KNVR_PATH_MAX];
     size_t count = 0u;
     int64_t wanted;
-    char segment[KNVR_PATH_MAX];
-    char output[KNVR_PATH_MAX];
-    char clips[KNVR_PATH_MAX];
     const knvr_event *event = NULL;
     int status = 1;
 
@@ -898,55 +915,16 @@ static int command_clip(int argc, char **argv)
             break;
         }
     }
-    if (event == NULL ||
-        !segment_covering(event->camera, event->started, segment,
-                          sizeof(segment))) {
-        (void)fprintf(stderr, "kilix-nvr: no footage for event %lld\n",
+    /* The cut itself lives in knvr_clip, because the recorder does it too
+     * and a clip cut by hand must not differ from one cut on the way past. */
+    if (event == NULL) {
+        (void)fprintf(stderr, "kilix-nvr: no event %lld\n", (long long)wanted);
+    } else if (knvr_clip_cut(store, event, output, sizeof(output))) {
+        (void)printf("%s\n", output);
+        status = 0;
+    } else {
+        (void)fprintf(stderr, "kilix-nvr: no footage covering event %lld\n",
                       (long long)wanted);
-        knvr_store_close(store);
-        return 1;
-    }
-    if (!knvr_paths_subdir(clips, sizeof(clips), "clips") ||
-        snprintf(output, sizeof(output), "%s/%s-%lld.mkv", clips,
-                 event->camera, (long long)wanted) < 0) {
-        knvr_store_close(store);
-        return 1;
-    }
-    {
-        struct stat info;
-        pid_t child;
-        int wait_status = 0;
-        long offset = 0;
-        char start[32];
-        char duration[32];
-
-        if (stat(segment, &info) == 0) {
-            /* Ten seconds of pre-roll, clamped at the segment's start. */
-            const long into = (long)(event->started - info.st_mtime);
-
-            offset = into > 10 ? into - 10 : 0;
-        }
-        (void)snprintf(start, sizeof(start), "%ld", offset);
-        (void)snprintf(duration, sizeof(duration), "%lld",
-                       (long long)((event->ended > event->started
-                                        ? event->ended - event->started
-                                        : 10) + 10));
-        child = fork();
-        if (child == 0) {
-            (void)execlp("ffmpeg", "ffmpeg", "-hide_banner", "-loglevel",
-                         "error", "-nostdin", "-ss", start, "-i", segment,
-                         "-t", duration, "-c", "copy", "-y", output,
-                         (char *)NULL);
-            _exit(127);
-        }
-        if (child > 0 && waitpid(child, &wait_status, 0) == child &&
-            WIFEXITED(wait_status) && WEXITSTATUS(wait_status) == 0) {
-            (void)knvr_store_add_media(store, wanted, "clip", output);
-            (void)printf("%s\n", output);
-            status = 0;
-        } else {
-            (void)fprintf(stderr, "kilix-nvr: could not cut the clip\n");
-        }
     }
     knvr_store_close(store);
     return status;
