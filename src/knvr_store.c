@@ -107,7 +107,19 @@ static const char SCHEMA[] =
     "CREATE UNIQUE INDEX IF NOT EXISTS object_identity "
     "ON object(event, track);"
     "CREATE INDEX IF NOT EXISTS object_by_zone ON object(zone) "
-    "WHERE zone <> '';";
+    "WHERE zone <> '';"
+    /*
+     * One row per camera-second: what moved and how loud it was.  Small
+     * enough to outlive the footage - 86,400 rows a day per camera is
+     * under a megabyte - and it is what makes an empty night skimmable.
+     */
+    "CREATE TABLE IF NOT EXISTS pulse ("
+    "  camera TEXT NOT NULL,"
+    "  at INTEGER NOT NULL,"
+    "  motion REAL NOT NULL DEFAULT 0,"
+    "  audio REAL NOT NULL DEFAULT 0,"
+    "  PRIMARY KEY (camera, at)"
+    ") WITHOUT ROWID;";
 
 /*
  * Columns added after the first release.
@@ -549,6 +561,87 @@ bool knvr_store_objects(
     if (count != NULL) {
         *count = total;
     }
+    return true;
+}
+
+/* -------------------------------- the pulse ------------------------------ */
+
+bool knvr_store_pulse(
+    knvr_store *store, const char *camera, int64_t at, float motion,
+    float audio)
+{
+    sqlite3_stmt *statement = NULL;
+    bool ok;
+
+    if (store == NULL || camera == NULL || camera[0] == '\0') {
+        return false;
+    }
+    /* The larger of what is there and what just arrived, so the caller
+     * can offer every frame without knowing which second it is in. */
+    if (sqlite3_prepare_v2(
+            store->db,
+            "INSERT INTO pulse (camera, at, motion, audio) "
+            "VALUES (?1, ?2, ?3, ?4) "
+            "ON CONFLICT(camera, at) DO UPDATE SET "
+            "motion = MAX(pulse.motion, excluded.motion), "
+            "audio = MAX(pulse.audio, excluded.audio);",
+            -1, &statement, NULL) != SQLITE_OK) {
+        return fail_sqlite(store, "cannot record the pulse");
+    }
+    (void)sqlite3_bind_text(statement, 1, camera, -1, SQLITE_TRANSIENT);
+    (void)sqlite3_bind_int64(statement, 2, at);
+    (void)sqlite3_bind_double(statement, 3, (double)motion);
+    (void)sqlite3_bind_double(statement, 4, (double)audio);
+    ok = sqlite3_step(statement) == SQLITE_DONE;
+    sqlite3_finalize(statement);
+    return ok;
+}
+
+bool knvr_store_pulse_series(
+    const knvr_store *store, const char *camera, int64_t from, int64_t to,
+    knvr_pulse *out, size_t count)
+{
+    knvr_store *mutable_store = (knvr_store *)store;
+    sqlite3_stmt *statement = NULL;
+    int64_t span;
+
+    if (store == NULL || out == NULL || count == 0u || to <= from) {
+        return false;
+    }
+    span = to - from;
+    for (size_t i = 0u; i < count; i++) {
+        out[i].at = from + (int64_t)i * span / (int64_t)count;
+        out[i].motion = 0.0f;
+        out[i].audio = 0.0f;
+    }
+    if (sqlite3_prepare_v2(
+            store->db,
+            "SELECT at, motion, audio FROM pulse WHERE camera = ?1 AND "
+            "at >= ?2 AND at < ?3;",
+            -1, &statement, NULL) != SQLITE_OK) {
+        return fail_sqlite(mutable_store, "cannot read the pulse");
+    }
+    (void)sqlite3_bind_text(statement, 1, camera, -1, SQLITE_TRANSIENT);
+    (void)sqlite3_bind_int64(statement, 2, from);
+    (void)sqlite3_bind_int64(statement, 3, to);
+    while (sqlite3_step(statement) == SQLITE_ROW) {
+        const int64_t at = sqlite3_column_int64(statement, 0);
+        const float motion = (float)sqlite3_column_double(statement, 1);
+        const float audio = (float)sqlite3_column_double(statement, 2);
+        /* Which bucket this second lands in.  Peak again on the way in:
+         * a strip that means the loudest thing in each column is
+         * readable, and one that means the average of an hour is a flat
+         * line. */
+        const size_t bucket =
+            (size_t)(((at - from) * (int64_t)count) / span);
+
+        if (bucket >= count) {
+            continue;
+        }
+        if (motion > out[bucket].motion) { out[bucket].motion = motion; }
+        if (audio > out[bucket].audio) { out[bucket].audio = audio; }
+    }
+    sqlite3_finalize(statement);
     return true;
 }
 
