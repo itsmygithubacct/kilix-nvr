@@ -118,7 +118,8 @@ void knvr_detector_options_init(knvr_detector_options *options)
 bool knvr_detector_start(
     knvr_detector **out, const knvr_detector_options *options)
 {
-    static const char *const DEFAULT_ARGV[] = {"kilix-nvr-detect", NULL};
+    const char *default_argv[] = {NULL, NULL};
+    char bundled[1024];
     const char *env_argv[KNVR_DETECT_ARGV_MAX + 1];
     char env_storage[512];
     const char *const *chosen;
@@ -136,6 +137,8 @@ bool knvr_detector_start(
         knvr_detector_options_init(&defaults);
         options = &defaults;
     }
+    knvr_command_bundled("kilix-nvr-detect", bundled, sizeof(bundled));
+    default_argv[0] = bundled;
     chosen = options->argv;
     if (chosen == NULL &&
         knvr_command_from_env("KILIX_NVR_DETECT", env_storage,
@@ -144,7 +147,7 @@ bool knvr_detector_start(
         chosen = env_argv;
     }
     if (chosen == NULL) {
-        chosen = DEFAULT_ARGV;
+        chosen = default_argv;
     }
     if (options->width <= 0 || options->height <= 0) {
         return false;

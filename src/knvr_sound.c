@@ -173,7 +173,8 @@ static pid_t spawn_ffmpeg(const char *url, const char *log_path, int *out_fd)
 bool knvr_sound_start(
     knvr_sound **out, const char *url, const knvr_sound_options *options)
 {
-    static const char *const DEFAULT_ARGV[] = {"kilix-nvr-listen", NULL};
+    const char *default_argv[] = {NULL, NULL};
+    char bundled[1024];
     const char *env_argv[KNVR_SOUND_ARGV_MAX + 1];
     char env_storage[512];
     const char *const *chosen;
@@ -206,6 +207,8 @@ bool knvr_sound_start(
         free(sound);
         return false;
     }
+    knvr_command_bundled("kilix-nvr-listen", bundled, sizeof(bundled));
+    default_argv[0] = bundled;
     chosen = options->argv;
     if (chosen == NULL &&
         knvr_command_from_env("KILIX_NVR_LISTEN", env_storage,
@@ -214,7 +217,7 @@ bool knvr_sound_start(
         chosen = env_argv;
     }
     if (chosen == NULL) {
-        chosen = DEFAULT_ARGV;
+        chosen = default_argv;
     }
     {
         size_t words = 0u;

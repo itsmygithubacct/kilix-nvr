@@ -134,7 +134,7 @@ same pipe and the same windows as a camera.
 | shotgun pump, CC0 recording | gunshot 0.92 |
 | 2m44s of music | nothing over 0.20 |
 | 150 s of live audio, five cameras | nothing over 0.20 except one `shout 0.26` |
-| 5 minutes each on four cameras | two quiet, `speech 0.33` on one, `speech 0.59` on one |
+| 5 minutes each on all five cameras | two silent; `speech 0.33`, `speech 0.59`, and `speech 0.99` + `dog 0.74` |
 
 Two things worth taking from that.
 
@@ -148,25 +148,37 @@ minutes across all five cameras produced not one class over 0.20, let alone the
 0.50 default; the loudest thing anywhere was a `shout 0.26` that would not have
 been reported.
 
-**In twenty minutes, one window crossed it.** A five-minute sample from each of
-four cameras produced exactly one score over 0.50: `speech 0.59`, one window,
-with every other class at 0.03 or below — a clean, unambiguous answer rather
-than a smear across confusable classes, which is what a false positive
-usually looks like. Whether somebody actually spoke near that camera at that
-moment is not something this can establish; the honest statement is that the
-model was confident and nobody has listened to the second in question.
+**In twenty-five camera-minutes, three windows crossed it — and they do not
+look like mistakes.** Five minutes from each of the five cameras:
 
-That is the shape of the number to expect: **roughly one candidate event per
-twenty camera-minutes at the default threshold**, in a quiet suburban setting,
-before any per-class tuning.
+| camera | over 0.50 | what the model actually said |
+| --- | --- | --- |
+| two outdoor | — | nothing over 0.20 |
+| outdoor | — | `Speech 0.33` |
+| outdoor | speech 0.59 | `Speech 0.59`, everything else ≤ 0.03 |
+| indoor | speech 0.99, dog 0.74 | `Speech 0.99` with `Inside, small room 0.02`; and separately `Dog 0.74, Animal 0.67, Domestic animals 0.67, Bark 0.59` |
+
+The indoor camera's dog is the interesting one, because of its *shape*: four
+related AudioSet classes rising together is what a real dog looks like, where
+the earlier `shout 0.26` was a lone class with nothing agreeing with it. A
+coherent cluster is evidence; an isolated score is a coin toss.
+
+None of this has been confirmed by ear — nobody has listened to the seconds in
+question, and "an indoor camera heard a voice and a dog in five afternoon
+minutes" is a claim about a plausible house, not a verified event. What can be
+said is the rate: **roughly one candidate per eight camera-minutes indoors and
+one per twenty outdoors**, at the default threshold, before any per-class
+tuning.
 
 ### What is not measured
 
-- **Six of the nine classes have no positive control**: glass, dog, alarm,
+- **Five of the nine classes have no positive control at all**: glass, alarm,
   siren, vehicle and knock. The CC0 library on this machine is game foley, not
   security audio; its "breaking glass" clips are 0.7 s of tinkling that YAMNet
   reads as a coin dropping, which says more about the clips than about the
-  model. Those six are untested and should be treated as untested.
+  model. Treat those five as untested. **Dog** has one live observation with a
+  coherent class cluster behind it, which is better than nothing and is not the
+  same as a control.
 - **No recall figure on camera audio.** Knowing it fires on a clean TTS voice
   is not knowing it will catch a shout in a garden at night.
 - **No per-class thresholds.** One `min_score` governs all nine, and the right
