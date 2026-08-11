@@ -16,6 +16,8 @@
 
 #include "knvr_view.h"
 
+#include "knvr_run.h"
+
 #include "knvr_paths.h"
 #include "knvr_strip.h"
 #include "knvr_track.h"
@@ -59,6 +61,17 @@
 
 typedef struct feed {
     char name[KNVR_NAME_MAX];
+    /*
+     * Exactly one of these two.
+     *
+     * `attached` is the recorder's ring: when `kilix-nvr run` is already
+     * decoding this camera, watching it should cost nothing more than a
+     * memcpy.  A second RTSP session to the same camera is the thing to
+     * avoid - some of these cameras allow only a handful, and the ones
+     * that allow more answer the extra one by dropping frames on both.
+     * `source` is the fallback for a camera nobody is recording.
+     */
+    krtsp_frame *attached;
     krtsp_source *source;
     kmd_detector *motion;
     kod_detector *detector;
@@ -68,7 +81,7 @@ typedef struct feed {
     kod_box boxes[KOD_BOX_MAX];
     size_t box_count;
     uint8_t *frame;            /* the last frame, with overlays drawn */
-    uint64_t seen;             /* source frames at the last borrow */
+    uint64_t seen;             /* frame counter at the last borrow */
     uint64_t frames;
     int64_t second;            /* the second being accumulated */
     float motion_peak;
@@ -175,6 +188,9 @@ static void feed_stop(feed *at)
     ksd_close(at->sound);
     kod_close(at->detector);
     kmd_detector_free(at->motion);
+    /* Never unlinked: the recorder owns the object, and a viewer that
+     * removes it on the way out takes the camera down for everyone. */
+    krtsp_frame_free(at->attached);
     krtsp_source_stop(at->source);
     knvr_ring_free(&at->motion_ring);
     knvr_ring_free(&at->sound_ring);
@@ -189,6 +205,7 @@ static bool feed_start(feed *at, const char *name, bool listen)
     ksd_options sound_options;
     char url[KRTSP_URL_MAX];
     char log_path[KNVR_PATH_MAX];
+    char ring_name[KNVR_NAME_MAX + 32];
 
     (void)memset(at, 0, sizeof(*at));
     (void)snprintf(at->name, sizeof(at->name), "%.*s",
@@ -196,16 +213,32 @@ static bool feed_start(feed *at, const char *name, bool listen)
     if (!resolve_url(name, url, sizeof(url))) {
         return false;
     }
-    krtsp_source_options_init(&source_options);
-    source_options.pixfmt = KRTSP_PIXFMT_BGRA;
-    source_options.width = DECODE_W;
-    source_options.height = DECODE_H;
-    source_options.letterbox = true;
-    if (knvr_paths_state_file(log_path, sizeof(log_path), "ffmpeg.log")) {
-        source_options.log_path = log_path;
+    /*
+     * The recorder's frames if it is running, this camera's own if not.
+     *
+     * Checked by size rather than trusted: the ring carries whatever
+     * geometry the recorder chose, and treating a differently-shaped
+     * frame as this one would read every pixel at the wrong offset.
+     */
+    if (knvr_run_ring_name(name, ring_name, sizeof(ring_name)) &&
+        krtsp_frame_attach(&at->attached, ring_name) &&
+        krtsp_frame_size(at->attached) !=
+            (size_t)DECODE_W * (size_t)DECODE_H * 4u) {
+        krtsp_frame_free(at->attached);
+        at->attached = NULL;
     }
-    if (!krtsp_source_start(&at->source, url, &source_options)) {
-        return false;
+    if (at->attached == NULL) {
+        krtsp_source_options_init(&source_options);
+        source_options.pixfmt = KRTSP_PIXFMT_BGRA;
+        source_options.width = DECODE_W;
+        source_options.height = DECODE_H;
+        source_options.letterbox = true;
+        if (knvr_paths_state_file(log_path, sizeof(log_path), "ffmpeg.log")) {
+            source_options.log_path = log_path;
+        }
+        if (!krtsp_source_start(&at->source, url, &source_options)) {
+            return false;
+        }
     }
     kmd_config_init(&motion_config);
     motion_config.width = DECODE_W;
@@ -304,11 +337,32 @@ static bool feed_step(feed *at, knvr_store *store)
             at->sound = NULL;
         }
     }
-    krtsp_source_get_stats(at->source, &stats);
-    if (stats.frames == at->seen) {
-        /* Nothing new.  Borrowing anyway would hand back the same frame
-         * and difference it against itself, which reads as a camera that
-         * has stopped moving. */
+    /*
+     * Nothing new is the common case and has to be cheap.  Borrowing
+     * anyway would hand back the same frame and difference it against
+     * itself, which reads as a camera that has stopped moving - and on an
+     * attached ring it would also count the recorder's frame twice.
+     */
+    if (at->attached != NULL) {
+        uint64_t sequence = 0u;
+
+        pixels = krtsp_frame_borrow(at->attached, &sequence, &age_ms);
+        if (pixels != NULL && sequence == at->seen) {
+            krtsp_frame_release(at->attached);
+            pixels = NULL;
+        } else if (pixels != NULL) {
+            at->seen = sequence;
+        }
+    } else {
+        krtsp_source_get_stats(at->source, &stats);
+        pixels = stats.frames == at->seen
+                     ? NULL
+                     : krtsp_source_borrow(at->source, &age_ms);
+        if (pixels != NULL) {
+            at->seen = stats.frames;
+        }
+    }
+    if (pixels == NULL) {
         if (at->second != 0 && now != at->second) {
             (void)knvr_store_pulse(store, at->name, at->second,
                                    at->motion_peak, at->sound_peak);
@@ -320,18 +374,17 @@ static bool feed_step(feed *at, knvr_store *store)
         }
         return false;
     }
-    pixels = krtsp_source_borrow(at->source, &age_ms);
-    if (pixels == NULL) {
-        return false;
-    }
-    at->seen = stats.frames;
     at->frames++;
     at->online = true;
     (void)memcpy(at->frame, pixels,
                  (size_t)DECODE_W * (size_t)DECODE_H * 4u);
     moved_count = kmd_detect(at->motion, pixels, motion,
                              sizeof(motion) / sizeof(motion[0]), &result);
-    krtsp_source_release(at->source);
+    if (at->attached != NULL) {
+        krtsp_frame_release(at->attached);
+    } else {
+        krtsp_source_release(at->source);
+    }
 
     if (result.motion_fraction > at->motion_peak && !result.calibrating) {
         at->motion_peak = result.motion_fraction;
@@ -736,8 +789,10 @@ static void draw_picture(sr_canvas *canvas, const feed *at, int x, int y,
         sr_fill_rect(canvas, (float)x, (float)y, (float)width, (float)height,
                      PANEL, 1.0f);
         sr_text(canvas, (float)(x + 8), (float)(y + height / 2),
-                at->source != NULL ? "waiting for a frame" : "offline", DIM,
-                1.0f, 1);
+                at->source != NULL || at->attached != NULL
+                    ? "waiting for a frame"
+                    : "offline",
+                DIM, 1.0f, 1);
         return;
     }
     {
@@ -953,7 +1008,12 @@ static void compose(sr_canvas *canvas, view *state)
     } else {
         const feed *at = &state->feeds[state->focus];
 
-        (void)snprintf(line, sizeof(line), "%s%s", at->name,
+        /* Whether this picture cost the camera a second connection is
+         * worth saying: it is the difference between watching being free
+         * and watching competing with the recorder for the stream. */
+        (void)snprintf(line, sizeof(line), "%s%s%s", at->name,
+                       at->attached != NULL ? "   recorder's frames"
+                                            : "   own stream",
                        at->detector != NULL ? "   detecting" : "");
     }
     sr_text(canvas, 8.0f, 7.0f, line, TEXT, 1.0f, 1);

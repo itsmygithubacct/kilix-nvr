@@ -70,6 +70,7 @@ OBJECTS := \
 	$(BUILD_DIR)/knvr_command.o \
 	$(BUILD_DIR)/knvr_config.o \
 	$(BUILD_DIR)/knvr_review.o \
+	$(BUILD_DIR)/knvr_run.o \
 	$(BUILD_DIR)/knvr_sqlite.o \
 	$(BUILD_DIR)/knvr_store.o \
 	$(BUILD_DIR)/knvr_strip.o \
@@ -82,7 +83,8 @@ STATIC_LIB := $(BUILD_DIR)/lib$(PROJECT).a
 COMMAND := $(BUILD_DIR)/$(PROJECT)
 
 TESTS := $(BUILD_DIR)/test-config $(BUILD_DIR)/test-store \
-	$(BUILD_DIR)/test-track $(BUILD_DIR)/test-watch \
+	$(BUILD_DIR)/test-run $(BUILD_DIR)/test-track \
+	$(BUILD_DIR)/test-watch \
 	$(BUILD_DIR)/test-zone
 
 .DEFAULT_GOAL := all
