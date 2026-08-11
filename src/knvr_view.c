@@ -29,6 +29,8 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -98,6 +100,14 @@ typedef struct replay {
     bool fast;
     bool paused;
     bool ended;
+    bool muted;
+    pid_t player;            /* ffplay on the same segment, same offset */
+    /* Where the day strip was last drawn, so a click on it can be turned
+     * back into a time.  Kept from the drawing rather than recomputed,
+     * because two places deciding where a widget is is how a scrubber
+     * seeks to somewhere you did not point at. */
+    int strip_x;
+    int strip_w;
     knvr_detection marks[64];
     size_t mark_count;
     float day[720];          /* the day's motion, one bucket per column */
@@ -362,6 +372,9 @@ static bool feed_step(feed *at, knvr_store *store)
 
 /* -------------------------------- replay --------------------------------- */
 
+struct view;
+static void replay_open(struct view *state, const knvr_event *event);
+
 /*
  * The segment covering a moment, and when that segment starts.
  *
@@ -421,8 +434,75 @@ static bool segment_at(const char *camera, int64_t when, char *out,
     return found;
 }
 
+/*
+ * Sound on replay, as its own ffplay on the same file at the same
+ * offset.
+ *
+ * Not pcm-mixer, which is a cue bank for game audio and has nothing to
+ * say about a recording's soundtrack; and not decoded in-process,
+ * because that would mean an audio device, a resampler and a clock this
+ * program has no other use for.  Two readers of one file, started
+ * together, is close enough to synchronised for reviewing a doorbell -
+ * and it is honest that it is only close: the picture is paced by the
+ * ring and the sound by ffplay, so a long clip drifts.
+ */
+static void audio_stop(replay *back)
+{
+    int status;
+
+    if (back->player <= 0) {
+        return;
+    }
+    (void)kill(back->player, SIGTERM);
+    for (int waited = 0; waited < 1000; waited += 20) {
+        struct timespec pause = {0, 20 * 1000 * 1000};
+
+        if (waitpid(back->player, &status, WNOHANG) == back->player) {
+            back->player = 0;
+            return;
+        }
+        (void)nanosleep(&pause, NULL);
+    }
+    (void)kill(back->player, SIGKILL);
+    (void)waitpid(back->player, &status, 0);
+    back->player = 0;
+}
+
+static void audio_start(replay *back)
+{
+    char offset[32];
+
+    audio_stop(back);
+    if (back->muted || back->fast || back->segment[0] == '\0' ||
+        back->paused) {
+        /* Nothing at x4: a soundtrack at four times speed is a noise, not
+         * information. */
+        return;
+    }
+    (void)snprintf(offset, sizeof(offset), "%d", back->offset);
+    back->player = fork();
+    if (back->player < 0) {
+        back->player = 0;
+        return;
+    }
+    if (back->player == 0) {
+        const int null_fd = open("/dev/null", O_WRONLY);
+
+        if (null_fd >= 0) {
+            (void)dup2(null_fd, STDOUT_FILENO);
+            (void)dup2(null_fd, STDERR_FILENO);
+            (void)close(null_fd);
+        }
+        (void)execlp("ffplay", "ffplay", "-nodisp", "-autoexit", "-loglevel",
+                     "quiet", "-vn", "-ss", offset, back->segment,
+                     (char *)NULL);
+        _exit(127);
+    }
+}
+
 static void replay_stop(replay *back)
 {
+    audio_stop(back);
     krtsp_source_stop(back->source);
     free(back->frame);
     back->source = NULL;
@@ -431,7 +511,7 @@ static void replay_stop(replay *back)
     back->ended = false;
 }
 
-static void replay_open(view *state, const knvr_event *event)
+static void replay_open(struct view *state, const knvr_event *event)
 {
     replay *back = &state->back;
     krtsp_source_options options;
@@ -491,6 +571,7 @@ static void replay_open(view *state, const knvr_event *event)
     back->seen = 0u;
     back->active = true;
     back->paused = false;
+    audio_start(back);
 day:
     back->mark_count = 0u;
     (void)knvr_store_detections(state->store, event->id, back->marks, 64u,
@@ -522,6 +603,30 @@ day:
             }
         }
     }
+}
+
+/*
+ * Go to a moment in the day being replayed.
+ *
+ * Reopening rather than anything cleverer: speed and position are both
+ * "where ffmpeg was told to start", so both are a restart, and a restart
+ * of a keyframe seek is milliseconds.
+ */
+static void replay_seek(struct view *state, int64_t when)
+{
+    replay *back = &state->back;
+    knvr_event moment;
+
+    if (!back->active || back->camera[0] == '\0') {
+        return;
+    }
+    if (when < back->day_from) { when = back->day_from; }
+    if (when > back->day_to) { when = back->day_to; }
+    (void)memset(&moment, 0, sizeof(moment));
+    (void)snprintf(moment.camera, sizeof(moment.camera), "%.*s",
+                   (int)sizeof(moment.camera) - 1, back->camera);
+    moment.started = when;
+    replay_open(state, &moment);
 }
 
 static void replay_step(replay *back)
@@ -771,9 +876,9 @@ static void compose_replay(sr_canvas *canvas, view *state)
     sr_text(canvas,
             (float)(width - 8 -
                     sr_text_width_in(SR_FONT_FIXED_8X16,
-                                     "space pause  f fast  l live  q quit",
+                                     "space  f fast  m mute  arrows seek  l live  q quit",
                                      1)),
-            7.0f, "space pause  f fast  l live  q quit", DIM, 1.0f, 1);
+            7.0f, "space  f fast  m mute  arrows seek  l live  q quit", DIM, 1.0f, 1);
 
     if (back->frame != NULL) {
         sr_canvas picture;
@@ -810,6 +915,9 @@ static void compose_replay(sr_canvas *canvas, view *state)
                                (back->day_to - back->day_from));
     }
     knvr_strip_draw(canvas, &strip, 8, 32 + picture_h + 8, stage_w, STRIP_H);
+    /* 64 is the strip's own label gutter; the plot starts after it. */
+    back->strip_x = 8 + 64;
+    back->strip_w = stage_w - 64;
     strip.label = "sound";
     strip.samples = back->day_audio;
     strip.colour = SOUND_COLOUR;
@@ -978,6 +1086,10 @@ int knvr_view(
     if (!headless) {
         kittyts_session_init(&session);
         kittyts_options_init(&session_options);
+        /* Dragging the day is the natural way to move through it, and the
+         * strip already knows where it was drawn. */
+        session_options.mouse_tracking = KITTYIN_MOUSE_TRACKING_DRAG;
+        session_options.pixel_mouse = true;
         if (kittyts_start(&session, STDIN_FILENO, STDOUT_FILENO,
                           &session_options) != 0) {
             (void)fprintf(stderr, "kilix-nvr: %s\n",
@@ -1020,6 +1132,7 @@ int knvr_view(
 
     while (running) {
         struct pollfd descriptor = {STDIN_FILENO, POLLIN, 0};
+        kittyin_event event;
         kittykb_event key;
         bool fresh = false;
 
@@ -1078,8 +1191,55 @@ int knvr_view(
         if (poll(&descriptor, 1u, 20) > 0) {
             (void)kittyts_read_input(&session);
         }
-        while (kittyts_next_key_event(&session, &key)) {
+        while (kittyts_next_event(&session, &event)) {
+            if (event.kind == KITTYIN_EVENT_MOUSE) {
+                const kittyin_mouse_event *mouse = &event.data.mouse;
+
+                /* A press or a drag on the day seeks to where it points.
+                 * The geometry comes from the drawing rather than being
+                 * recomputed here: two places deciding where a widget is
+                 * is how a scrubber seeks to somewhere nobody pointed. */
+                if (state.back.active && state.back.strip_w > 0 &&
+                    (mouse->action == KITTYIN_MOUSE_PRESS ||
+                     mouse->action == KITTYIN_MOUSE_MOVE) &&
+                    mouse->button == 1 &&
+                    mouse->x >= state.back.strip_x &&
+                    mouse->x < state.back.strip_x + state.back.strip_w) {
+                    const double across =
+                        (double)(mouse->x - state.back.strip_x) /
+                        (double)state.back.strip_w;
+
+                    replay_seek(&state, state.back.day_from +
+                                            (int64_t)(across *
+                                                      (double)(state.back.day_to -
+                                                               state.back.day_from)));
+                    last_draw = 0;
+                }
+                continue;
+            }
+            if (event.kind != KITTYIN_EVENT_KEY) {
+                continue;
+            }
+            key = event.data.key;
             if (key.action == KITTYKB_ACTION_RELEASE) {
+                continue;
+            }
+            /* In a recording the arrows move through time; live, they move
+             * between cameras.  Same keys, and in each mode the only thing
+             * they could sensibly mean. */
+            if (state.back.active &&
+                (key.key == KITTYKB_KEY_LEFT ||
+                 key.key == KITTYKB_KEY_RIGHT)) {
+                replay_seek(&state,
+                            state.back.at +
+                                (key.key == KITTYKB_KEY_RIGHT ? 10 : -10));
+                last_draw = 0;
+                continue;
+            }
+            if (state.back.active && key.key == 'm') {
+                state.back.muted = !state.back.muted;
+                audio_start(&state.back);
+                last_draw = 0;
                 continue;
             }
             if (key.key == 'q' || key.key == KITTYKB_KEY_ESCAPE) {
@@ -1112,6 +1272,13 @@ int knvr_view(
                 replay_stop(&state.back);
             } else if (key.key == ' ') {
                 state.back.paused = !state.back.paused;
+                if (state.back.paused) {
+                    audio_stop(&state.back);
+                } else {
+                    /* Resuming picks the sound up where the picture is,
+                     * not where it was paused. */
+                    replay_seek(&state, state.back.at);
+                }
             } else if (key.key == 'f') {
                 state.back.fast = !state.back.fast;
                 if (state.back.active && state.back.segment[0] != '\0') {
