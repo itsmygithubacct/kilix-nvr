@@ -69,6 +69,7 @@ void knvr_watch_options_init(knvr_watch_options *options)
     options->width = 640;
     options->height = 360;
     options->fps_cap = 0;
+    options->motion = true;
 }
 
 /*
@@ -141,20 +142,25 @@ bool knvr_watch_start(
     watch->width = options->width;
     watch->height = options->height;
 
-    kmd_config_init(&motion);
-    motion.width = options->width;
-    motion.height = options->height;
-    /* BGRA from the source lands straight in an sr_canvas on
-     * little-endian, and the detector reads the same order. */
-    motion.pixfmt = KMD_PIXFMT_BGRA;
-    if (!kmd_detector_create(&watch->detector, &motion)) {
-        free(watch);
-        return false;
+    if (options->motion) {
+        kmd_config_init(&motion);
+        motion.width = options->width;
+        motion.height = options->height;
+        /* BGRA from the source lands straight in an sr_canvas on
+         * little-endian, and the detector reads the same order. */
+        motion.pixfmt = KMD_PIXFMT_BGRA;
+        if (!kmd_detector_create(&watch->detector, &motion)) {
+            free(watch);
+            return false;
+        }
+        watch->scaled_width = kmd_detector_scaled_width(watch->detector);
+        watch->scaled_height = kmd_detector_scaled_height(watch->detector);
     }
-    watch->scaled_width = kmd_detector_scaled_width(watch->detector);
-    watch->scaled_height = kmd_detector_scaled_height(watch->detector);
 
-    if (options->mask_path != NULL && options->mask_path[0] != '\0') {
+    /* A mask with nothing to difference is a contradiction rather than a
+     * detail: it says which pixels to ignore, and none are being read. */
+    if (watch->detector != NULL && options->mask_path != NULL &&
+        options->mask_path[0] != '\0') {
         if (!apply_mask(watch, options->mask_path, options->width,
                         options->height)) {
             /* Kept so the caller can report it, then torn down: running
@@ -278,6 +284,9 @@ bool knvr_watch_step(
         *rgba = frame;
     }
 
+    if (watch->detector == NULL) {
+        return true;   /* motion=off: decoded, and deliberately unwatched */
+    }
     written = kmd_detect(watch->detector, frame, found, KNVR_MOTION_BOX_MAX,
                          &result);
     if (!result.calibrating) {

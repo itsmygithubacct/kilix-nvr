@@ -728,6 +728,61 @@ bool knvr_store_events(
     return true;
 }
 
+bool knvr_store_recent_detections(
+    const knvr_store *store, const char *camera, int64_t since,
+    knvr_detection *out, size_t capacity, size_t *count)
+{
+    knvr_store *mutable_store = (knvr_store *)store;
+    sqlite3_stmt *statement = NULL;
+    size_t total = 0u;
+
+    if (count != NULL) {
+        *count = 0u;
+    }
+    if (store == NULL || camera == NULL || out == NULL || capacity == 0u) {
+        return false;
+    }
+    /* By camera and time rather than by event, because the caller is a
+     * viewer looking at a live picture: it knows which camera is on
+     * screen and does not know, or want to know, which event is open. */
+    if (sqlite3_prepare_v2(
+            store->db,
+            "SELECT d.event, d.at, d.label, d.score, d.x, d.y, d.w, d.h, "
+            "d.track, d.zone FROM detection d JOIN event e ON d.event = e.id "
+            "WHERE e.camera = ?1 AND d.at >= ?2 AND d.w > 0 "
+            "ORDER BY d.at DESC LIMIT ?3;",
+            -1, &statement, NULL) != SQLITE_OK) {
+        return fail_sqlite(mutable_store, "cannot query recent detections");
+    }
+    (void)sqlite3_bind_text(statement, 1, camera, -1, SQLITE_TRANSIENT);
+    (void)sqlite3_bind_int64(statement, 2, since);
+    (void)sqlite3_bind_int(statement, 3, (int)capacity);
+    while (sqlite3_step(statement) == SQLITE_ROW && total < capacity) {
+        const unsigned char *label = sqlite3_column_text(statement, 2);
+        const unsigned char *zone = sqlite3_column_text(statement, 9);
+
+        (void)memset(&out[total], 0, sizeof(out[total]));
+        out[total].event = sqlite3_column_int64(statement, 0);
+        out[total].at = sqlite3_column_int64(statement, 1);
+        (void)snprintf(out[total].label, sizeof(out[total].label), "%s",
+                       label != NULL ? (const char *)label : "");
+        out[total].score = sqlite3_column_double(statement, 3);
+        out[total].x = sqlite3_column_int(statement, 4);
+        out[total].y = sqlite3_column_int(statement, 5);
+        out[total].w = sqlite3_column_int(statement, 6);
+        out[total].h = sqlite3_column_int(statement, 7);
+        out[total].track = sqlite3_column_int64(statement, 8);
+        (void)snprintf(out[total].zone, sizeof(out[total].zone), "%s",
+                       zone != NULL ? (const char *)zone : "");
+        total++;
+    }
+    sqlite3_finalize(statement);
+    if (count != NULL) {
+        *count = total;
+    }
+    return true;
+}
+
 bool knvr_store_detections(
     const knvr_store *store, int64_t event_id, knvr_detection *out,
     size_t capacity, size_t *count)

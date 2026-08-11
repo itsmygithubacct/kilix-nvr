@@ -142,6 +142,23 @@ test_names_round_trip_through_their_spellings(void)
 
         (void)snprintf(assignment, sizeof(assignment), "record=%s",
                        knvr_record_mode_name((knvr_record_mode)mode));
+        /*
+         * `clips` is the one spelling that prints and does not set.
+         *
+         * It has a name because a store written before the check can hold
+         * it and a camera has to be describable; it is refused because
+         * nothing cuts clips yet, and accepting it meant a camera
+         * reporting a mode it did not have.  The asymmetry is deliberate,
+         * so it is asserted rather than tolerated.
+         */
+        if (mode == KNVR_RECORD_CLIPS) {
+            reason = NULL;
+            CHECK(!knvr_camera_set(&camera, assignment, &reason));
+            CHECK(reason != NULL);
+            CHECK(strstr(reason, "not implemented") != NULL);
+            CHECK((int)camera.record != mode);
+            continue;
+        }
         CHECK(knvr_camera_set(&camera, assignment, &reason));
         CHECK((int)camera.record == mode);
     }

@@ -12,6 +12,7 @@
 #include "knvr_paths.h"
 #include "knvr_review.h"
 #include "knvr_run.h"
+#include "knvr_service.h"
 #include "knvr_view.h"
 #include "kilix_sound_detect.h"
 #include "knvr_track.h"
@@ -45,6 +46,9 @@ static int usage(FILE *stream)
         "  run [name...] [--seconds N] [--verbose] [--no-publish]\n"
         "                          record every camera at once until stopped,\n"
         "                          publishing frames for a viewer to attach\n"
+        "  service [install|remove|status]\n"
+        "                          run at login and keep running, with an\n"
+        "                          hourly prune so retention actually runs\n"
         "  watch <name> [--seconds N] [--render OUT.ppm]\n"
         "                          one camera in the foreground, saying what\n"
         "                          it sees: the same recorder, out loud\n"
@@ -387,6 +391,8 @@ int main(int argc, char **argv)
         status = command_watch(config, argc - 2, argv + 2);
     } else if (strcmp(command, "run") == 0) {
         status = command_run(config, argc - 2, argv + 2);
+    } else if (strcmp(command, "service") == 0) {
+        status = knvr_service(argc > 2 ? argv[2] : NULL);
     } else if (strcmp(command, "events") == 0) {
         status = command_events(argc - 2, argv + 2);
     } else if (strcmp(command, "view") == 0) {

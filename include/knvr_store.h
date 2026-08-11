@@ -195,6 +195,18 @@ bool knvr_store_detections(
     const knvr_store *store, int64_t event_id, knvr_detection *out,
     size_t capacity, size_t *count);
 
+/*
+ * What a camera has seen lately, newest first.
+ *
+ * For a live viewer attached to a recorder's frames: it knows the camera
+ * on screen and has no reason to know which event is open, and asking
+ * the recorder's answer beats loading a second copy of the model to
+ * re-derive it.
+ */
+bool knvr_store_recent_detections(
+    const knvr_store *store, const char *camera, int64_t since,
+    knvr_detection *out, size_t capacity, size_t *count);
+
 /* -------------------------------- the pulse ------------------------------ */
 
 /*

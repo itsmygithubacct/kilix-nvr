@@ -71,6 +71,7 @@ OBJECTS := \
 	$(BUILD_DIR)/knvr_config.o \
 	$(BUILD_DIR)/knvr_review.o \
 	$(BUILD_DIR)/knvr_run.o \
+	$(BUILD_DIR)/knvr_service.o \
 	$(BUILD_DIR)/knvr_sqlite.o \
 	$(BUILD_DIR)/knvr_store.o \
 	$(BUILD_DIR)/knvr_strip.o \
