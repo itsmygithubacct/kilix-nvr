@@ -50,9 +50,10 @@ static int usage(FILE *stream)
         "  zone add <name> <zone> [inertia=N] [preclusive=yes] [loiter=S]\n"
         "  zone remove <name> <zone>\n"
         "  zone paint <name>       grab a frame and paint its zones\n"
-        "  view [name]             watch the cameras: the picture, what the\n"
+        "  view [name] [--replay]  watch the cameras: the picture, what the\n"
         "                          models make of it, and motion and sound\n"
-        "                          drawn as waveforms under each one\n"
+        "                          drawn as waveforms under each one.  r on\n"
+        "                          an event replays it; l returns to live\n"
         "  review                  browse events with the frame that caused\n"
         "                          them; up/down to select, q to quit\n"
         "  play <event>            print the footage covering an event\n"
@@ -392,6 +393,8 @@ int main(int argc, char **argv)
                 view_options.seconds = atoi(argv[++i]);
             } else if (strcmp(argv[i], "--no-detect") == 0) {
                 view_options.detect = false;
+            } else if (strcmp(argv[i], "--replay") == 0) {
+                view_options.replay = true;
             } else if (argv[i][0] != '-') {
                 view_options.camera = argv[i];
             } else {
