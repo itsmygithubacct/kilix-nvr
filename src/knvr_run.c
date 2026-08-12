@@ -27,7 +27,9 @@
 #include "kilix_rtsp.h"
 #include "kilix_sound_detect.h"
 
+#include <fcntl.h>
 #include <signal.h>
+#include <sys/file.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -108,6 +110,19 @@ typedef struct camera_run {
      */
     uint8_t *offered;
     int64_t offered_at;
+    /*
+     * An exclusive lock on this camera, held for the run.
+     *
+     * Two recorders on one camera is silent damage, not a clash: both
+     * archive it, both write into one segments directory with one
+     * manifest, both open the camera, both publish to a ring only one can
+     * own, and both write events.  Nothing errors - the footage simply
+     * becomes two interleaved series and the disk fills twice as fast.
+     * It is also the ordinary mistake: a service is running and somebody
+     * types `kilix-nvr run` to see what it is doing, which is exactly how
+     * this was found.
+     */
+    int lock_fd;
     ksd_listener *sound;
     knvr_tracker *tracker;
     knvr_zones *zones;
@@ -251,8 +266,63 @@ static bool start_listener(camera_run *run)
     return ksd_open(&run->sound, sound_url, &sound_options);
 }
 
+/*
+ * Claim a camera, or report who has it.
+ *
+ * flock rather than a pid file: the kernel drops it when the process
+ * dies, however it dies, so a recorder killed with -9 does not lock a
+ * camera out until somebody notices a stale file.
+ */
+static bool camera_claim(camera_run *run)
+{
+    char path[KNVR_PATH_MAX];
+    char leaf[KNVR_NAME_MAX + 8];
+    char line[64];
+
+    if (snprintf(leaf, sizeof(leaf), "%s.lock", run->name) < 0 ||
+        !knvr_paths_state_file(path, sizeof(path), leaf)) {
+        return true;   /* cannot lock: recording matters more than the guard */
+    }
+    run->lock_fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (run->lock_fd < 0) {
+        return true;
+    }
+    if (flock(run->lock_fd, LOCK_EX | LOCK_NB) != 0) {
+        char holder[64] = "";
+        const ssize_t got = read(run->lock_fd, holder, sizeof(holder) - 1u);
+
+        if (got > 0) {
+            holder[got] = '\0';
+        }
+        (void)fprintf(stderr,
+                      "kilix-nvr: %s: already being recorded%s%s; skipping\n",
+                      run->name, holder[0] != '\0' ? " by pid " : "",
+                      holder[0] != '\0' ? holder : "");
+        (void)close(run->lock_fd);
+        run->lock_fd = -1;
+        return false;
+    }
+    /* Whose it is, for the message the next one prints. */
+    if (ftruncate(run->lock_fd, 0) == 0 &&
+        snprintf(line, sizeof(line), "%ld", (long)getpid()) > 0) {
+        (void)write(run->lock_fd, line, strlen(line));
+    }
+    return true;
+}
+
+static void camera_release(camera_run *run)
+{
+    if (run->lock_fd >= 0) {
+        /* Closing drops the lock; the file stays so the next run can read
+         * who had it while it is still held. */
+        (void)close(run->lock_fd);
+        run->lock_fd = -1;
+    }
+}
+
 static void camera_stop(camera_run *run)
 {
+    camera_release(run);
     knvr_watch_stop(run->watch);
     free(run->offered);
     ksd_close(run->sound);
@@ -268,13 +338,18 @@ static bool camera_start(camera_run *run, const knvr_camera *policy,
                          const knvr_run_options *options)
 {
     (void)memset(run, 0, sizeof(*run));
+    run->lock_fd = -1;
     run->policy = *policy;
     (void)snprintf(run->name, sizeof(run->name), "%.*s",
                    (int)sizeof(run->name) - 1, policy->name);
 
+    if (!camera_claim(run)) {
+        return false;
+    }
     if (!resolve_url(run->name, true, run->url, sizeof(run->url))) {
         (void)fprintf(stderr, "kilix-nvr: %s: no stream URL in cameras.conf\n",
                       run->name);
+        camera_release(run);
         return false;
     }
     knvr_watch_options_init(&run->options);
@@ -330,6 +405,7 @@ static bool camera_start(camera_run *run, const knvr_camera *policy,
                           : "could not start the camera");
         knvr_watch_stop(run->watch);
         run->watch = NULL;
+        camera_release(run);
         return false;
     }
     run->offered = malloc((size_t)knvr_watch_width(run->watch) *
@@ -337,6 +413,7 @@ static bool camera_start(camera_run *run, const knvr_camera *policy,
     if (run->offered == NULL) {
         knvr_watch_stop(run->watch);
         run->watch = NULL;
+        camera_release(run);
         return false;
     }
     {
