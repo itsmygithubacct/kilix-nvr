@@ -25,6 +25,8 @@
 
 #include "kilix_rtsp.h"
 
+#include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -703,7 +705,26 @@ static int command_prune(knvr_config *config, int argc, char **argv)
         if (strcmp(argv[i], "--dry-run") == 0) {
             dry_run = true;
         } else if (strcmp(argv[i], "--cap-mb") == 0 && i + 1 < argc) {
-            cap_bytes = (uint64_t)atoll(argv[++i]) * 1024u * 1024u;
+            const char *text = argv[++i];
+            char *end = NULL;
+            unsigned long long cap_mb;
+
+            errno = 0;
+            if (text[0] < '0' || text[0] > '9') {
+                (void)fprintf(stderr,
+                              "kilix-nvr: --cap-mb must be a positive "
+                              "whole number\n");
+                return 2;
+            }
+            cap_mb = strtoull(text, &end, 10);
+            if (errno == ERANGE || end == text || *end != '\0' || cap_mb == 0u ||
+                cap_mb > UINT64_MAX / (1024u * 1024u)) {
+                (void)fprintf(stderr,
+                              "kilix-nvr: --cap-mb is zero, malformed, or "
+                              "too large\n");
+                return 2;
+            }
+            cap_bytes = (uint64_t)cap_mb * 1024u * 1024u;
         } else {
             return usage(stderr);
         }

@@ -91,7 +91,7 @@ TESTS := $(BUILD_DIR)/test-clip $(BUILD_DIR)/test-config \
 	$(BUILD_DIR)/test-zone
 
 .DEFAULT_GOAL := all
-.PHONY: all test sanitize install clean
+.PHONY: all test test-install sanitize install clean
 
 all: $(COMMAND)
 
@@ -131,31 +131,43 @@ test: $(TESTS) $(COMMAND)
 	done; \
 	printf '\n== %s --selftest ==\n' "$(COMMAND)"; \
 	$(COMMAND) --selftest; \
+	printf '\n== command-line boundaries ==\n'; \
+	tests/test_cli.sh "$(COMMAND)"; \
+	$(MAKE) --no-print-directory test-install; \
 	printf '\nall test suites passed\n'
+
+test-install: $(COMMAND)
+	@set -eu; stage=$$(mktemp -d); trap 'rm -rf "$$stage"' EXIT; \
+	$(MAKE) --no-print-directory install DESTDIR="$$stage"; \
+	actual=$$(find "$$stage$(PREFIX)/bin" -maxdepth 1 -type f \
+		-printf '%f\n' | LC_ALL=C sort); \
+	expected=$$(printf '%s\n' kilix-listen-classify kilix-look-detect \
+		kilix-nvr kilix-sound-fetch-model | LC_ALL=C sort); \
+	test "$$actual" = "$$expected" || { \
+		printf 'installed command manifest mismatch\nexpected:\n%s\nactual:\n%s\n' \
+			"$$expected" "$$actual" >&2; exit 1; }; \
+	env -u KILIX_OBJECT_DETECTOR PATH="$$stage$(PREFIX)/bin:$$PATH" \
+		sh -c 'test "$$(command -v kilix-look-detect)" = "$$1"' sh \
+		"$$stage$(PREFIX)/bin/kilix-look-detect"; \
+	env -u KILIX_OBJECT_DETECTOR KILIX_NVR_HOME="$$stage/state" \
+		"$$stage$(PREFIX)/bin/kilix-nvr" --selftest >/dev/null
 
 sanitize: CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer
 sanitize: LDFLAGS += -fsanitize=address,undefined
 sanitize: clean
 	@$(MAKE) --no-print-directory CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" test
 
-# The detector goes with the binary: knvr_detect spawns it by name, so a
-# command installed without it is a recorder that silently never detects.
-# The sound side's tools belong to kilix-sound-detect and are installed by
-# it, because two copies of a classifier is two things to keep in step.
-TOOLS :=
-# The detector and the classifier belong to the modules that own them, and
-# are installed by them: two copies of a detector is two things to keep in
-# step.
-KSD_TOOLS := $(KSD)/tools/kilix-listen-classify \
+# These module-owned helpers go with the binary: the NVR resolves them beside
+# its installed command before falling back to PATH.  Omitting the object
+# detector silently degrades an enabled camera to motion-only recording.
+INSTALL_TOOLS := $(KSD)/tools/kilix-listen-classify \
 	$(KSD)/tools/kilix-sound-fetch-model \
 	$(KOD)/tools/kilix-look-detect
-KSD_TOOLS := $(KSD)/tools/kilix-listen-classify \
-	$(KSD)/tools/kilix-sound-fetch-model
 
 install: all
 	$(INSTALL) -d $(DESTDIR)$(PREFIX)/bin
 	$(INSTALL) -m 755 $(COMMAND) $(DESTDIR)$(PREFIX)/bin/
-	$(INSTALL) -m 755 $(KSD_TOOLS) $(DESTDIR)$(PREFIX)/bin/
+	$(INSTALL) -m 755 $(INSTALL_TOOLS) $(DESTDIR)$(PREFIX)/bin/
 
 clean:
 	rm -rf $(BUILD_DIR)
