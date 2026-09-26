@@ -11,7 +11,7 @@
  * host reaches the same models the same way.
  *
  *   KILIX_NVR_DETECT="ssh gpubox kilix-nvr-detect"
- *   KILIX_NVR_LISTEN="/home/me/.local/share/kilix-nvr/venv/bin/python \
+ *   KILIX_NVR_LISTEN="/opt/kilix-nvr/venv/bin/python \
  *                     /usr/local/bin/kilix-nvr-listen"
  *
  * Split on spaces, with no quoting: a path with a space in it needs a
