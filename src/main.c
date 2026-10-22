@@ -27,6 +27,7 @@
 
 #include <errno.h>
 #include <stdint.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,6 +46,8 @@ static int usage(FILE *stream)
         "  add <name>              onboard a camera; every capability off\n"
         "  set <name> <k=v>...     change what it does\n"
         "  cameras                 what exists and what each one is doing\n"
+        "  check <name> [--seconds N]\n"
+        "                          verify fresh video without recording (default 10s)\n"
         "  remove <name>           forget a camera's policy\n"
         "  run [name...] [--seconds N] [--verbose] [--no-publish]\n"
         "                          record every camera at once until stopped,\n"
@@ -118,6 +121,105 @@ static bool rtsp_knows(const char *name, bool *checked)
     }
     krtsp_config_free(config);
     return known;
+}
+
+static volatile sig_atomic_t check_interrupted;
+
+static void check_signal(int signal_number)
+{
+    check_interrupted = signal_number;
+}
+
+static int command_check(int argc, char **argv)
+{
+    krtsp_config *cameras = NULL;
+    krtsp_source *source = NULL;
+    krtsp_source_options options;
+    krtsp_source_stats stats = {0};
+    const krtsp_camera *camera;
+    const char *url;
+    char error[256];
+    long seconds = 10;
+    struct timespec started, now;
+    struct sigaction action = {0}, old_int, old_term;
+    bool fresh = false;
+
+    if (argc != 1 && argc != 3) {
+        return usage(stderr);
+    }
+    if (argc == 3) {
+        char *end;
+        errno = 0;
+        seconds = strtol(argv[2], &end, 10);
+        if (strcmp(argv[1], "--seconds") != 0 || errno != 0 ||
+            argv[2][0] < '0' || argv[2][0] > '9' || *end != '\0' || seconds < 1 || seconds > 60) {
+            (void)fprintf(stderr, "kilix-nvr: check --seconds must be an integer from 1 to 60\n");
+            return 2;
+        }
+    }
+    if (!krtsp_config_load(&cameras, NULL, error, sizeof(error))) {
+        (void)fprintf(stderr, "kilix-nvr: camera configuration: %s\n", error);
+        return 1;
+    }
+    camera = krtsp_config_find(cameras, argv[0]);
+    url = camera != NULL ? krtsp_camera_url(camera, KRTSP_TIER_SUB) : NULL;
+    if (url == NULL) {
+        (void)fprintf(stderr, "kilix-nvr: camera name is absent from cameras.conf\n");
+        krtsp_config_free(cameras);
+        return 1;
+    }
+    krtsp_source_options_init(&options);
+    options.width = 320;
+    options.height = 180;
+    options.fps_cap = 5;
+    options.roles = KRTSP_ROLE_DECODE;
+    /* No recorder, detector, event store or diagnostic URL log. A separate
+     * short session makes this useful even when the resident recorder failed. */
+    check_interrupted = 0;
+    action.sa_handler = check_signal;
+    sigemptyset(&action.sa_mask);
+    if (sigaction(SIGINT, &action, &old_int) != 0) {
+        krtsp_config_free(cameras);
+        return 1;
+    }
+    if (sigaction(SIGTERM, &action, &old_term) != 0) {
+        (void)sigaction(SIGINT, &old_int, NULL);
+        krtsp_config_free(cameras);
+        return 1;
+    }
+    (void)clock_gettime(CLOCK_MONOTONIC, &started);
+    if (krtsp_source_start(&source, url, &options)) {
+        do {
+            int age = 0;
+            const uint8_t *frame = krtsp_source_borrow(source, &age);
+            krtsp_source_get_stats(source, &stats);
+            fresh = frame != NULL && age >= 0 && age < 1000 && stats.frames >= 3;
+            if (frame != NULL) {
+                krtsp_source_release(source);
+            }
+            if (fresh || check_interrupted) {
+                break;
+            }
+            (void)nanosleep(&(struct timespec){0, 50000000}, NULL);
+            (void)clock_gettime(CLOCK_MONOTONIC, &now);
+        } while ((double)(now.tv_sec - started.tv_sec) +
+                 (double)(now.tv_nsec - started.tv_nsec) / 1e9 < (double)seconds);
+    }
+    krtsp_source_stop(source);
+    (void)sigaction(SIGINT, &old_int, NULL);
+    (void)sigaction(SIGTERM, &old_term, NULL);
+    krtsp_config_free(cameras);
+    if (check_interrupted) {
+        return 128 + check_interrupted;
+    }
+    if (!fresh) {
+        (void)fprintf(stderr, "kilix-nvr: no fresh video within %ld seconds; "
+                      "check the configured address, LAN route or tunnel, camera account and FFmpeg\n", seconds);
+        return 1;
+    }
+    (void)printf("%s: fresh video received (%llu decoded frames); no recording started\n",
+                 argv[0], (unsigned long long)stats.frames);
+    return 0;
 }
 
 static int command_add(knvr_config *config, int argc, char **argv)
@@ -379,6 +481,9 @@ int main(int argc, char **argv)
     }
     if (strcmp(command, "--selftest") == 0) {
         return selftest();
+    }
+    if (strcmp(command, "check") == 0) {
+        return command_check(argc - 2, argv + 2);
     }
     if (!knvr_config_open(&config, NULL)) {
         (void)fprintf(stderr, "kilix-nvr: cannot open the policy store\n");

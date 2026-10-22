@@ -167,9 +167,11 @@ stays expensive forever.
 ## Commands
 
 ```sh
-kilix-nvr add       <name> <url>    # onboard a camera; prompts for capabilities
+kilix-nvr add       <name>          # add policy for a camera in cameras.conf
 kilix-nvr set       <name> <k=v>... # change any capability afterwards
 kilix-nvr cameras                   # what exists and what each one is doing
+kilix-nvr check     <name>          # verify fresh video without recording
+kilix-nvr view      <name>          # open its live picture in this terminal
 kilix-nvr watch     <name>          # run one camera, honouring its config
 kilix-nvr events    [--since ...]   # query what happened
 kilix-nvr review                    # review interface
@@ -187,6 +189,23 @@ configuration, not an invocation.
 
 `clip <event>` cuts an event out of the segments without re-encoding, and
 `watch <name>` is what runs one camera in the foreground.
+
+Before opening a view, `kilix-nvr check doorway --seconds 10` tests the configured
+substream (or main stream when no substream exists). It succeeds only after at
+least three decoded frames and a frame less than one second old. It opens a
+short independent session, stops it on success, timeout or interruption, and
+does not start recording, detection or an event database. The timeout accepts
+1–60 seconds; FFmpeg startup probing and process cleanup can add a few seconds.
+Diagnostics do not print the camera URL. A failure can mean a missing LAN route
+or tunnel, an unavailable camera, rejected credentials, or a local FFmpeg issue;
+it does not establish which of those failed.
+
+On Plebian OS, `pleb displays launch DP-1 -- kilix nvr view doorway` opens the
+viewer in its own Kilix window on the named display, when that display command
+is available. Use `pleb displays list` for connector names. A camera on another
+subnet still needs a working route or a private relay/tunnel before the viewer
+can receive frames. Keep its endpoint in the private `kilix-rtsp` configuration,
+not in a desktop launcher or this checkout.
 
 ## Dependencies
 
@@ -210,9 +229,23 @@ script, which is a smaller surprise than half-implemented shell quoting.
 
 ## Configuration and data
 
-Everything the program reads or writes lives outside this repository, under
-`~/.local/gpu_terminal/kilix-nvr/` — configuration, recordings, the event
-index, state and logs. Override the root with `KILIX_NVR_HOME`.
+Recorder policy, recordings, the event index, state and logs live outside this
+repository under `~/.local/gpu_terminal/kilix-nvr/`. Override that root with
+`KILIX_NVR_HOME`. Camera names and URLs are shared with `kilix-rtsp` through
+`~/.local/gpu_terminal/kilix-rtsp/config/cameras.conf` (root override:
+`KILIX_RTSP_HOME`). Define the URL there before adding NVR policy for its name.
+For a private local relay, a minimal camera definition is:
+
+```ini
+[camera "doorway"]
+main = rtsp://127.0.0.1:18554/doorway
+sub = rtsp://127.0.0.1:18554/doorway
+```
+
+The example requires an existing relay at that address. Keep the file mode
+`0600` and its component directories `0700`; then run `kilix-nvr add doorway`,
+`kilix-nvr check doorway`, and `kilix-nvr view doorway`. Adding policy leaves
+recording and detection disabled until explicitly configured.
 
 **Camera configuration is a secret file.** RTSP URLs embed credentials as
 `rtsp://user:password@host/path`, so it lives outside the work tree, is refused
