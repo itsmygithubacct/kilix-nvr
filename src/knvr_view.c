@@ -1318,6 +1318,8 @@ int knvr_view(
     if (!headless) {
         kittyts_session_init(&session);
         kittyts_options_init(&session_options);
+        session_options.framebuffer.max_width = 3840;
+        session_options.framebuffer.max_height = 2160;
         /* Dragging the day is the natural way to move through it, and the
          * strip already knows where it was drawn. */
         session_options.mouse_tracking = KITTYIN_MOUSE_TRACKING_DRAG;
@@ -1370,6 +1372,37 @@ int knvr_view(
 
         if (deadline > 0 && time(NULL) >= deadline) {
             break;
+        }
+        if (!headless) {
+            int next_width, next_height;
+
+            if (kittyts_check_resize(&session, &next_width, &next_height)) {
+                sr_canvas next_canvas = {0};
+                uint8_t *next_rgba;
+
+                /* Terminal pixel geometry can change after startup when the
+                 * window manager moves/maximizes a window onto another output.
+                 * Keep decoding at the shared feed size; only the presentation
+                 * canvas changes, preserving live/replay sources and history. */
+                if (!sr_canvas_init(&next_canvas, next_width, next_height)) {
+                    status = 1;
+                    break;
+                }
+                next_rgba = malloc((size_t)next_width * (size_t)next_height * 4u);
+                if (next_rgba == NULL) {
+                    sr_canvas_free(&next_canvas);
+                    status = 1;
+                    break;
+                }
+                free(rgba);
+                sr_canvas_free(&canvas);
+                rgba = next_rgba;
+                canvas = next_canvas;
+                width = next_width;
+                height = next_height;
+                state.mouse_seen = false;
+                last_draw = 0;
+            }
         }
         if (state.back.active) {
             replay_step(&state.back);

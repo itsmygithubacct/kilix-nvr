@@ -202,7 +202,9 @@ it does not establish which of those failed.
 
 On Plebian OS, `pleb displays launch DP-1 -- kilix nvr view doorway` opens the
 viewer in its own Kilix window on the named display, when that display command
-is available. Use `pleb displays list` for connector names. A camera on another
+is available. The viewer follows terminal resizing up to 3840×2160 pixels,
+including a window maximized after startup. Resizing replaces the presentation
+canvas without restarting its camera decoders. Use `pleb displays list` for connector names. A camera on another
 subnet still needs a working route or a private relay/tunnel before the viewer
 can receive frames. Keep its endpoint in the private `kilix-rtsp` configuration,
 not in a desktop launcher or this checkout.
