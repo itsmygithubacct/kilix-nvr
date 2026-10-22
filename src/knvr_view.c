@@ -1352,7 +1352,7 @@ int knvr_view(
         refresh_events(&state);
         for (size_t i = 0u; i < state.event_count; i++) {
             /* The newest event on the camera that was asked for, rather
-             * than the newest anywhere: `view sample-outdoor --replay` meaning
+             * than the newest anywhere: `view sample-camera --replay` meaning
              * "the drive camera's last event" would be a surprise. */
             if (options->camera == NULL ||
                 strcmp(state.events[i].camera, options->camera) == 0) {

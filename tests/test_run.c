@@ -36,12 +36,12 @@ static bool test_the_name_is_composed_not_guessed(void)
 {
     char name[128];
 
-    CHECK(knvr_run_ring_name("sample-front", name, sizeof(name)));
-    CHECK(strcmp(name, "kilix-nvr.sample-front") == 0);
+    CHECK(knvr_run_ring_name("sample-camera", name, sizeof(name)));
+    CHECK(strcmp(name, "kilix-nvr.sample-camera") == 0);
     /* Both sides call this, so a viewer looking for a camera it was told
      * about finds the ring the recorder made. */
     CHECK(!knvr_run_ring_name(NULL, name, sizeof(name)));
-    CHECK(!knvr_run_ring_name("sample-front", NULL, sizeof(name)));
+    CHECK(!knvr_run_ring_name("sample-camera", NULL, sizeof(name)));
     return true;
 }
 

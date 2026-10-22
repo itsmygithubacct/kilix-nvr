@@ -22,6 +22,8 @@ git submodule update --init --recursive
 make && make test
 ```
 
+Personal camera names, URLs, credentials, recordings, and deployment notes must stay outside this repository. Keep camera configuration in `~/.local/gpu_terminal/kilix-rtsp/config/cameras.conf` with mode `0600` and private parent directories. Repository examples use synthetic camera names.
+
 ## What you configure
 
 Every camera is a set of independently selectable capabilities. You choose them
@@ -68,10 +70,10 @@ opens in any image viewer. The cost is that regions cannot overlap — a point i
 in exactly one zone or none.
 
 ```sh
-kilix-nvr zone add   sample-front driveway inertia=3
-kilix-nvr zone add   sample-front road preclusive=yes
-kilix-nvr zone paint sample-front          # grabs a frame, hands over to kilix-mask
-kilix-nvr zones      sample-front
+kilix-nvr zone add   sample-camera driveway inertia=3
+kilix-nvr zone add   sample-camera road preclusive=yes
+kilix-nvr zone paint sample-camera          # grabs a frame, hands over to kilix-mask
+kilix-nvr zones      sample-camera
 kilix-nvr events --zone driveway
 ```
 

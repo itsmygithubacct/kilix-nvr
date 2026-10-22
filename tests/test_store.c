@@ -515,7 +515,7 @@ static bool test_an_older_store_is_migrated(void)
                        "  path TEXT NOT NULL,"
                        "  bytes INTEGER NOT NULL DEFAULT 0);"
                        "INSERT INTO event (id, camera, started, ended) "
-                       "VALUES (7, 'sample-indoor', 1759000000, 1759000030);"
+                       "VALUES (7, 'sample-camera', 1759000000, 1759000030);"
                        "INSERT INTO detection VALUES "
                        "(7, 1759000010, 'person', 0.75, 1, 2, 3, 4);",
                        NULL, NULL, NULL) == SQLITE_OK);
@@ -538,7 +538,7 @@ static bool test_an_older_store_is_migrated(void)
         (void)memset(&object, 0, sizeof(object));
         object.event = 7;
         object.track = 1;
-        (void)snprintf(object.camera, sizeof(object.camera), "sample-indoor");
+        (void)snprintf(object.camera, sizeof(object.camera), "sample-camera");
         (void)snprintf(object.label, sizeof(object.label), "person");
         object.first_seen = 1759000010;
         object.last_seen = 1759000012;
