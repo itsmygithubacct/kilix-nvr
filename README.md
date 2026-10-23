@@ -173,7 +173,9 @@ kilix-nvr add       <name>          # add policy for a camera in cameras.conf
 kilix-nvr set       <name> <k=v>... # change any capability afterwards
 kilix-nvr cameras                   # what exists and what each one is doing
 kilix-nvr check     <name>          # verify fresh video without recording
-kilix-nvr view      <name>          # open its live picture in this terminal
+kilix-nvr view      [name]          # one camera, or all configured cameras in a grid
+kilix-nvr run       [name...]       # run camera policies until stopped
+kilix-nvr service   install         # install the user recorder service and prune timer
 kilix-nvr watch     <name>          # run one camera, honouring its config
 kilix-nvr events    [--since ...]   # query what happened
 kilix-nvr review                    # review interface
@@ -191,6 +193,18 @@ configuration, not an invocation.
 
 `clip <event>` cuts an event out of the segments without re-encoding, and
 `watch <name>` is what runs one camera in the foreground.
+
+To show all configured cameras together, use `kilix-nvr view --no-detect`.
+Four cameras form a 2×2 grid; they are ordered by their configured names.
+Press `g` to toggle the grid, Tab to cycle cameras, and `q` to quit.
+`--no-detect` disables viewer object detection; it does not change an existing
+recorder's policy or disable the viewer's motion and sound processing.
+
+**Viewing does not record.** New camera policies have recording disabled.
+Use `set` to select recording and retention, then `run` or the user service to
+execute those policies. The event list and replay read this NVR's own store;
+pointing a camera at another recorder's RTSP relay does not import that
+recorder's history.
 
 Before opening a view, `kilix-nvr check doorway --seconds 10` tests the configured
 substream (or main stream when no substream exists). It succeeds only after at
