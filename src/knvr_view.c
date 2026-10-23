@@ -1008,8 +1008,10 @@ static void draw_events(sr_canvas *canvas, const view *state, int x, int y,
             1.0f, 1);
     row += 24;
     if (state->event_count == 0u) {
-        sr_text(canvas, (float)(x + 8), (float)row, "nothing yet", DIM, 1.0f,
-                1);
+        sr_text(canvas, (float)(x + 8), (float)row, "no recorded events", DIM,
+                1.0f, 1);
+        sr_text(canvas, (float)(x + 8), (float)(row + 18),
+                "viewing does not record", DIM, 1.0f, 1);
         return;
     }
     for (size_t i = 0u; i < state->event_count && row + 16 < y + height;
@@ -1293,10 +1295,25 @@ int knvr_view(
     state.detect = options->detect;
     state.grid = options->camera == NULL;
 
-    if (!knvr_config_list(config, cameras, KNVR_CAMERA_MAX, &configured)) {
-        return 1;
+    if (options->camera != NULL) {
+        /* A named view must work even when it sorts beyond the grid's
+         * bounded camera list. */
+        if (knvr_config_get(config, options->camera, &cameras[0])) {
+            configured = 1u;
+        }
+    } else {
+        if (!knvr_config_list(config, cameras, KNVR_CAMERA_MAX, &configured)) {
+            return 1;
+        }
+        if (configured > KNVR_CAMERA_MAX) {
+            (void)fprintf(stderr,
+                          "kilix-nvr: too many cameras for the grid; "
+                          "select a camera by name\n");
+            return 1;
+        }
     }
-    for (size_t i = 0u; i < configured && state.count < FEED_MAX; i++) {
+    for (size_t i = 0u; i < configured && i < KNVR_CAMERA_MAX &&
+                        state.count < FEED_MAX; i++) {
         if (options->camera != NULL &&
             strcmp(cameras[i].name, options->camera) != 0) {
             continue;

@@ -16,7 +16,39 @@ static bool ensure_directory(const char *path)
     }
     /* 0700 throughout.  The event store records when a house was empty,
      * which is not a fact to leave group-readable by default. */
-    return mkdir(path, 0700) == 0 || errno == EEXIST;
+    if (mkdir(path, 0700) == 0) {
+        return true;
+    }
+    return errno == EEXIST && stat(path, &info) == 0 &&
+           S_ISDIR(info.st_mode);
+}
+
+bool knvr_paths_mkdirs(const char *path)
+{
+    char copy[KNVR_PATH_MAX];
+    size_t length;
+
+    if (path == NULL || path[0] != '/') {
+        errno = EINVAL;
+        return false;
+    }
+    length = strlen(path);
+    if (length >= sizeof(copy)) {
+        errno = ENAMETOOLONG;
+        return false;
+    }
+    (void)memcpy(copy, path, length + 1u);
+    for (size_t i = 1u; i <= length; i++) {
+        if (copy[i] == '/' || copy[i] == '\0') {
+            const char saved = copy[i];
+            copy[i] = '\0';
+            if (!ensure_directory(copy)) {
+                return false;
+            }
+            copy[i] = saved;
+        }
+    }
+    return true;
 }
 
 bool knvr_paths_home(char *out, size_t size)
@@ -28,7 +60,11 @@ bool knvr_paths_home(char *out, size_t size)
     if (out == NULL || size == 0u) {
         return false;
     }
-    if (override != NULL && override[0] == '/') {
+    if (override != NULL && override[0] != '\0') {
+        if (override[0] != '/') {
+            errno = EINVAL;
+            return false;
+        }
         written = snprintf(out, size, "%s", override);
     } else {
         home = getenv("HOME");
@@ -41,7 +77,7 @@ bool knvr_paths_home(char *out, size_t size)
     if (written < 0 || (size_t)written >= size) {
         return false;
     }
-    return ensure_directory(out);
+    return knvr_paths_mkdirs(out);
 }
 
 bool knvr_paths_subdir(char *out, size_t size, const char *leaf)

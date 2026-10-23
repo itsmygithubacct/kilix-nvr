@@ -6,6 +6,7 @@ import pty
 import re
 import select
 import signal
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -24,7 +25,7 @@ class ResizeTests(unittest.TestCase):
             config = root / "rtsp/config"
             config.mkdir(mode=0o700, parents=True)
             config.parent.chmod(0o700)
-            camera = "resize-test-" + str(os.getpid())
+            camera = "z-resize-test-" + str(os.getpid())
             path = config / "cameras.conf"
             path.write_text(f'[camera "{camera}"]\nmain = rtsp://camera.invalid/stream\n')
             path.chmod(0o600)
@@ -46,6 +47,11 @@ while True:
                    "KILIX_SOUND_CLASSIFIER": "/bin/false", "VIEW_STARTS": str(root / "starts"),
                    "KITTYFB_SKIP_PROBE": "1", "KITTYFB_TRANSPORT": "inline"}
             subprocess.run([BINARY, "add", camera], env=env, check=True, capture_output=True)
+            # The requested camera sorts beyond the bounded grid list. A
+            # named view must still select it directly, then resize normally.
+            with sqlite3.connect(root / "nvr/state/cameras.db") as db:
+                db.executemany("INSERT INTO camera (name) VALUES (?)",
+                               [(f"sample-{i:03}",) for i in range(64)])
             master, slave = pty.openpty()
 
             def size(columns, rows):

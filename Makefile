@@ -134,6 +134,7 @@ test: $(TESTS) $(COMMAND)
 	printf '\n== command-line boundaries ==\n'; \
 	tests/test_cli.sh "$(COMMAND)"; \
 	python3 tests/test_check.py "$(COMMAND)"; \
+	python3 tests/test_startup.py "$(COMMAND)"; \
 	python3 tests/test_view_resize.py "$(COMMAND)"; \
 	$(MAKE) --no-print-directory test-install; \
 	printf '\nall test suites passed\n'

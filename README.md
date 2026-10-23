@@ -13,9 +13,8 @@ and presentation.
 become tracked objects, zones say where they were, sound events are heard,
 events are stored and reviewable, and retention deletes. Built and verified
 against live cameras. What is not here yet: per-class sound thresholds, and a
-positive control for six of the nine sound classes — see
-[`docs/SOUND-MODEL.md`](docs/SOUND-MODEL.md) for exactly what has and has not
-been measured.
+positive control for six of the nine sound classes. Sound-model coverage is
+incomplete; do not treat the available classes as equally validated.
 
 ```sh
 git submodule update --init --recursive
@@ -109,9 +108,8 @@ recorder. It simply never needs to.
 different rates and different failure modes, and a wedged audio model must not
 stop a camera seeing. The model is YAMNet — Apache-2.0, 4 MB, 16 kHz mono,
 3.5 ms per second of audio — mapped from its 521 AudioSet classes onto nine
-worth reporting. It is fetched by hash rather than vendored:
-[`docs/SOUND-MODEL.md`](docs/SOUND-MODEL.md) is why that model and what it
-actually does on 8 kHz camera audio.
+worth reporting. It is fetched by hash rather than vendored. The sound-class
+validation limitations above also apply to camera audio.
 
 **The model runs outside the core.** Object detection is a supervised subprocess
 speaking a fixed-size protocol on stdin/stdout — a tensor in, a
@@ -196,6 +194,9 @@ configuration, not an invocation.
 
 To show all configured cameras together, use `kilix-nvr view --no-detect`.
 Four cameras form a 2×2 grid; they are ordered by their configured names.
+The grid displays up to nine available feeds from at most 64 configured
+policies. Larger policy lists require a named view, which looks up the camera
+directly without the grid's list limit.
 Press `g` to toggle the grid, Tab to cycle cameras, and `q` to quit.
 `--no-detect` disables viewer object detection; it does not change an existing
 recorder's policy or disable the viewer's motion and sound processing.
@@ -205,6 +206,20 @@ Use `set` to select recording and retention, then `run` or the user service to
 execute those policies. The event list and replay read this NVR's own store;
 pointing a camera at another recorder's RTSP relay does not import that
 recorder's history.
+
+`kilix-nvr service install` creates missing user-unit directories, writes the
+recorder and hourly retention units, then enables retention before restarting
+the recorder. A retention setup failure returns an error and leaves an already
+running recorder alone. Check `systemctl --user status kilix-nvr.service` and
+`systemctl --user list-timers kilix-nvr-prune.timer` after installation.
+
+Service installation snapshots the resolved NVR and RTSP data roots, plus any
+explicit `KILIX_OBJECT_DETECTOR`, `KILIX_SOUND_CLASSIFIER`, and
+`KILIX_RTSP_FFMPEG` overrides, in `<NVR root>/state/service.env` with mode
+`0600`. The recorder and retention job use the same file. Re-run installation
+after changing these settings; a shell export alone does not update a running
+service. Explicit saved settings take precedence over the optional Kilix
+environment file. Removing the service preserves this file and recordings.
 
 Before opening a view, `kilix-nvr check doorway --seconds 10` tests the configured
 substream (or main stream when no substream exists). It succeeds only after at
@@ -249,7 +264,9 @@ script, which is a smaller surprise than half-implemented shell quoting.
 
 Recorder policy, recordings, the event index, state and logs live outside this
 repository under `~/.local/gpu_terminal/kilix-nvr/`. Override that root with
-`KILIX_NVR_HOME`. Camera names and URLs are shared with `kilix-rtsp` through
+`KILIX_NVR_HOME`, using an absolute path. Missing parent directories are
+created privately; a relative override is refused instead of silently opening
+the default store. Camera names and URLs are shared with `kilix-rtsp` through
 `~/.local/gpu_terminal/kilix-rtsp/config/cameras.conf` (root override:
 `KILIX_RTSP_HOME`). Define the URL there before adding NVR policy for its name.
 For a private local relay, a minimal camera definition is:

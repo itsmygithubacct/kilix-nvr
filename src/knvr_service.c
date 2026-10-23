@@ -60,7 +60,9 @@ static bool run_quietly(const char *const argv[], bool show)
         _exit(127);
     }
     while (waitpid(child, &status, 0) < 0) {
-        continue;
+        if (errno != EINTR) {
+            return false;
+        }
     }
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
@@ -84,19 +86,16 @@ static bool unit_dir(char *out, size_t size)
 {
     const char *config = getenv("XDG_CONFIG_HOME");
     const char *home = getenv("HOME");
+    int written;
 
     if (config != NULL && config[0] == '/') {
-        if (snprintf(out, size, "%s/systemd/user", config) < 0) {
-            return false;
-        }
+        written = snprintf(out, size, "%s/systemd/user", config);
     } else if (home != NULL && home[0] == '/') {
-        if (snprintf(out, size, "%s/.config/systemd/user", home) < 0) {
-            return false;
-        }
+        written = snprintf(out, size, "%s/.config/systemd/user", home);
     } else {
         return false;
     }
-    return true;
+    return written >= 0 && (size_t)written < size;
 }
 
 /* This executable, by absolute path.  A unit that said `kilix-nvr` would
@@ -105,11 +104,131 @@ static bool self_path(char *out, size_t size)
 {
     const ssize_t length = readlink("/proc/self/exe", out, size - 1u);
 
-    if (length <= 0) {
+    if (length <= 0 || (size_t)length >= size - 1u) {
         return false;
     }
     out[length] = '\0';
     return true;
+}
+
+/* Quote a systemd word, not a shell command. The executable path expands
+ * percent specifiers but is not subject to environment expansion.
+ * EnvironmentFile values expand neither. Refuse control bytes. */
+static bool quote_value(char *out, size_t size, const char *value,
+                        bool specifiers)
+{
+    size_t used = 0u;
+
+    if (size < 3u) {
+        return false;
+    }
+    out[used++] = '"';
+    for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+        if (*p < 32u || *p == 127u || used + 4u > size) {
+            return false;
+        }
+        if (*p == '\\' || *p == '"') {
+            out[used++] = '\\';
+        } else if (*p == '%' && specifiers) {
+            out[used++] = (char)*p;
+        }
+        out[used++] = (char)*p;
+    }
+    out[used++] = '"';
+    out[used] = '\0';
+    return true;
+}
+
+/* EnvironmentFile takes one literal path, including spaces, rather than a
+ * quoted word. Only specifier expansion applies to this directive. */
+static bool unit_path(char *out, size_t size, const char *path)
+{
+    size_t used = 0u;
+
+    if (path[0] != '/') {
+        return false;
+    }
+    for (const unsigned char *p = (const unsigned char *)path; *p; p++) {
+        if (*p < 32u || *p == 127u || used + 3u > size) {
+            return false;
+        }
+        if (*p == '%') {
+            out[used++] = '%';
+        }
+        out[used++] = (char)*p;
+    }
+    out[used] = '\0';
+    return true;
+}
+
+/* Preserve explicit CLI settings for both recorder and prune. Keep these
+ * private values in the data directory, not in world-readable unit bodies. */
+static bool write_environment(char *path, size_t size)
+{
+    const char *const names[] = {
+        "KILIX_NVR_HOME", "KILIX_RTSP_HOME", "KILIX_OBJECT_DETECTOR",
+        "KILIX_SOUND_CLASSIFIER", "KILIX_RTSP_FFMPEG"
+    };
+    char root[KNVR_PATH_MAX];
+    char camera_root[KNVR_PATH_MAX];
+    char temporary[KNVR_PATH_MAX + 16];
+    char quoted[KNVR_PATH_MAX * 2 + 3];
+    const char *rtsp = getenv("KILIX_RTSP_HOME");
+    FILE *file;
+    int fd;
+    bool ok = true;
+
+    if (!knvr_paths_home(root, sizeof(root)) ||
+        !knvr_paths_state_file(path, size, "service.env")) {
+        return false;
+    }
+    if (rtsp == NULL || rtsp[0] == '\0') {
+        const char *home = getenv("HOME");
+        const int written = snprintf(camera_root, sizeof(camera_root),
+                                      "%s/.local/gpu_terminal/kilix-rtsp",
+                                      home != NULL ? home : "");
+        if (home == NULL || home[0] != '/' || written < 0 ||
+            (size_t)written >= sizeof(camera_root)) {
+            return false;
+        }
+        rtsp = camera_root;
+    }
+    if (rtsp[0] != '/') {
+        return false;
+    }
+    (void)snprintf(temporary, sizeof(temporary), "%s.XXXXXX", path);
+    fd = mkstemp(temporary);
+    if (fd < 0) {
+        return false;
+    }
+    if (fchmod(fd, 0600) != 0) {
+        (void)close(fd);
+        (void)unlink(temporary);
+        return false;
+    }
+    file = fdopen(fd, "w");
+    if (file == NULL) {
+        (void)close(fd);
+        (void)unlink(temporary);
+        return false;
+    }
+    for (size_t i = 0u; i < sizeof(names) / sizeof(names[0]); i++) {
+        const char *value = i == 0u ? root : i == 1u ? rtsp : getenv(names[i]);
+        if (value != NULL && value[0] != '\0' &&
+            (!quote_value(quoted, sizeof(quoted), value, false) ||
+             fprintf(file, "%s=%s\n", names[i], quoted) < 0)) {
+            ok = false;
+            break;
+        }
+    }
+    if (fclose(file) != 0) {
+        ok = false;
+    }
+    if (ok && rename(temporary, path) == 0) {
+        return true;
+    }
+    (void)unlink(temporary);
+    return false;
 }
 
 static bool write_unit(const char *directory, const char *name,
@@ -118,7 +237,8 @@ static bool write_unit(const char *directory, const char *name,
     char path[KNVR_PATH_MAX];
     FILE *file;
 
-    if (snprintf(path, sizeof(path), "%s/%s", directory, name) < 0) {
+    const int written = snprintf(path, sizeof(path), "%s/%s", directory, name);
+    if (written < 0 || (size_t)written >= sizeof(path)) {
         return false;
     }
     file = fopen(path, "w");
@@ -126,8 +246,8 @@ static bool write_unit(const char *directory, const char *name,
         (void)fprintf(stderr, "kilix-nvr: cannot write %s\n", path);
         return false;
     }
-    (void)fputs(body, file);
-    if (fclose(file) != 0) {
+    const bool ok = fputs(body, file) >= 0;
+    if (fclose(file) != 0 || !ok) {
         return false;
     }
     (void)printf("wrote %s\n", path);
@@ -165,21 +285,30 @@ static void report_lingering(void)
 static int install(void)
 {
     char directory[KNVR_PATH_MAX];
-    char config[KNVR_PATH_MAX];
     char exe[KNVR_PATH_MAX];
-    char body[4096];
+    char quoted_exe[KNVR_PATH_MAX * 2 + 3];
+    char unit_config[KNVR_PATH_MAX * 2 + 3];
+    char environment[KNVR_PATH_MAX];
+    char unit_environment[KNVR_PATH_MAX * 2 + 3];
+    char body[16384];
     const char *env_file = NULL;
 
     if (!unit_dir(directory, sizeof(directory))) {
         (void)fprintf(stderr, "kilix-nvr: cannot locate the unit directory\n");
         return 1;
     }
-    if (!self_path(exe, sizeof(exe))) {
+    if (!self_path(exe, sizeof(exe)) ||
+        !quote_value(quoted_exe, sizeof(quoted_exe), exe, true)) {
         (void)fprintf(stderr, "kilix-nvr: cannot locate this executable\n");
         return 1;
     }
-    if (mkdir(directory, 0700) != 0 && errno != EEXIST) {
+    if (!knvr_paths_mkdirs(directory)) {
         (void)fprintf(stderr, "kilix-nvr: cannot create %s\n", directory);
+        return 1;
+    }
+    if (!write_environment(environment, sizeof(environment)) ||
+        !unit_path(unit_environment, sizeof(unit_environment), environment)) {
+        (void)fprintf(stderr, "kilix-nvr: cannot save the service environment\n");
         return 1;
     }
     /*
@@ -194,32 +323,35 @@ static int install(void)
         const char *home = getenv("GPU_TERMINAL_DATA_HOME");
         char candidate[KNVR_PATH_MAX];
         struct stat info;
+        int written;
 
         if (home == NULL || home[0] == '\0') {
             const char *user_home = getenv("HOME");
 
-            if (user_home != NULL &&
-                snprintf(candidate, sizeof(candidate),
-                         "%s/.local/gpu_terminal/kilix/config/kilix.env",
-                         user_home) > 0 &&
-                stat(candidate, &info) == 0) {
-                env_file = candidate;
+            if (user_home == NULL || user_home[0] != '/') {
+                return 1;
             }
-        } else if (snprintf(candidate, sizeof(candidate),
-                            "%s/kilix/config/kilix.env", home) > 0 &&
-                   stat(candidate, &info) == 0) {
-            env_file = candidate;
+            written = snprintf(candidate, sizeof(candidate),
+                                "%s/.local/gpu_terminal/kilix/config/kilix.env",
+                                user_home);
+        } else {
+            written = snprintf(candidate, sizeof(candidate),
+                                "%s/kilix/config/kilix.env", home);
         }
-        if (env_file != NULL) {
-            (void)snprintf(config, sizeof(config), "%s", env_file);
-            env_file = config;
+        if (written < 0 || (size_t)written >= sizeof(candidate)) {
+            return 1;
+        }
+        if (stat(candidate, &info) == 0) {
+            if (!unit_path(unit_config, sizeof(unit_config), candidate)) {
+                return 1;
+            }
+            env_file = unit_config;
         }
     }
 
     if (snprintf(body, sizeof(body),
                  "[Unit]\n"
                  "Description=kilix-nvr: record every configured camera\n"
-                 "Documentation=man:kilix-nvr\n"
                  "After=network-online.target\n"
                  "Wants=network-online.target\n"
                  "\n"
@@ -227,6 +359,7 @@ static int install(void)
                  "Type=simple\n"
                  "ExecStart=%s run\n"
                  "%s%s%s"
+                 "EnvironmentFile=%s\n"
                  /* Cameras drop out, ffmpeg dies, a model wedges.  A
                   * recorder that gives up on the first of those is not a
                   * recorder; the delay keeps a genuinely broken config
@@ -242,10 +375,10 @@ static int install(void)
                  "\n"
                  "[Install]\n"
                  "WantedBy=default.target\n",
-                 exe,
+                 quoted_exe,
                  env_file != NULL ? "EnvironmentFile=-" : "",
                  env_file != NULL ? env_file : "",
-                 env_file != NULL ? "\n" : "") < 0) {
+                 env_file != NULL ? "\n" : "", unit_environment) < 0) {
         return 1;
     }
     if (!write_unit(directory, UNIT_RECORD, body)) {
@@ -259,8 +392,9 @@ static int install(void)
                  "[Service]\n"
                  "Type=oneshot\n"
                  "ExecStart=%s prune\n"
+                 "EnvironmentFile=%s\n"
                  "NoNewPrivileges=true\n",
-                 exe) < 0) {
+                 quoted_exe, unit_environment) < 0) {
         return 1;
     }
     if (!write_unit(directory, UNIT_PRUNE, body)) {
@@ -298,8 +432,13 @@ static int install(void)
     }
     /* Two steps rather than `enable --now`, so the failure of each is
      * its own. */
-    (void)systemctl("enable", UNIT_TIMER, false);
-    (void)systemctl("start", UNIT_TIMER, false);
+    if (!systemctl("enable", UNIT_TIMER, true) ||
+        !systemctl("start", UNIT_TIMER, true)) {
+        (void)fprintf(stderr,
+                      "kilix-nvr: retention timer setup failed; recorder "
+                      "was not restarted\n");
+        return 1;
+    }
     if (!systemctl("enable", UNIT_RECORD, true) ||
         !systemctl("restart", UNIT_RECORD, true)) {
         (void)fprintf(stderr, "kilix-nvr: could not start %s\n", UNIT_RECORD);

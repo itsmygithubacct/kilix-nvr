@@ -21,6 +21,9 @@ extern "C" {
 
 #define KNVR_PATH_MAX 1024
 
+/* Create missing ancestors with mode 0700; preserve existing directories. */
+bool knvr_paths_mkdirs(const char *path);
+
 /* The root, honouring KILIX_NVR_HOME. */
 bool knvr_paths_home(char *out, size_t size);
 
