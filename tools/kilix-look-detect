@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""Run the installed YOLOX detector through Kilix's readiness checks."""
+import os
+import sys
+
+try:
+    os.execvp("kilix", ["kilix", "yolox", "run", *sys.argv[1:]])
+except OSError as error:
+    print(f"kilix-nvr: cannot run the YOLOX detector: {error}. "
+          "Prepare it with 'kilix install yolox', or configure "
+          "KILIX_OBJECT_DETECTOR explicitly.", file=sys.stderr)
+    sys.exit(127)

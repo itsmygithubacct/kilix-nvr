@@ -256,7 +256,13 @@ KILIX_SOUND_CLASSIFIER="$HOME/.venvs/audio/bin/python \
 ```
 
 Unset, each falls back to the bundled tool — beside the binary if `make
-install` put it there, else in the checkout's `tools/`, else on `PATH`. Both
+install` put it there, else in the checkout's `tools/`, else on `PATH`. The
+bundled object helper runs `kilix yolox run`: it checks the selected installed
+YOLOX model, agreement and runtime before starting inference. Prepare that
+runtime with `kilix install yolox`; recording never installs a model or
+answers its agreement prompt. Missing or invalid runtime state reports a
+detector failure while motion recording remains available. An explicit
+`KILIX_OBJECT_DETECTOR` continues to select your own command. Both overrides
 are split on spaces with no quoting: a path containing a space needs a wrapper
 script, which is a smaller surprise than half-implemented shell quoting.
 

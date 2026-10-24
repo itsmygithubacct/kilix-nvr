@@ -135,6 +135,7 @@ test: $(TESTS) $(COMMAND)
 	tests/test_cli.sh "$(COMMAND)"; \
 	python3 tests/test_check.py "$(COMMAND)"; \
 	python3 tests/test_startup.py "$(COMMAND)"; \
+	python3 tests/test_detector_launcher.py; \
 	python3 tests/test_view_resize.py "$(COMMAND)"; \
 	$(MAKE) --no-print-directory test-install; \
 	printf '\nall test suites passed\n'
@@ -160,12 +161,11 @@ sanitize: LDFLAGS += -fsanitize=address,undefined
 sanitize: clean
 	@$(MAKE) --no-print-directory CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" test
 
-# These module-owned helpers go with the binary: the NVR resolves them beside
-# its installed command before falling back to PATH.  Omitting the object
-# detector silently degrades an enabled camera to motion-only recording.
+# The object helper enters the installed YOLOX runtime through Kilix's model
+# and runtime checks. It never invokes the legacy model-fetching backend.
 INSTALL_TOOLS := $(KSD)/tools/kilix-listen-classify \
 	$(KSD)/tools/kilix-sound-fetch-model \
-	$(KOD)/tools/kilix-look-detect
+	tools/kilix-look-detect
 
 install: all
 	$(INSTALL) -d $(DESTDIR)$(PREFIX)/bin
