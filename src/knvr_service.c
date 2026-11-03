@@ -167,10 +167,11 @@ static bool write_environment(char *path, size_t size)
 {
     const char *const names[] = {
         "KILIX_NVR_HOME", "KILIX_RTSP_HOME", "KILIX_OBJECT_DETECTOR",
-        "KILIX_SOUND_CLASSIFIER", "KILIX_RTSP_FFMPEG",
+        "KILIX_SOUND_CLASSIFIER", "KILIX_SOUND_THRESHOLDS",
+        "KILIX_SOUND_PYTHON", "KILIX_YAMNET_DIR", "KILIX_RTSP_FFMPEG",
         "GPU_TERMINAL_DATA_HOME", "GPU_TERMINAL_SOURCE_HOME",
         "KILIX_YOLOX_DIR", "KILIX_YOLOX_SRC", "KILIX_YOLOX_MODEL",
-        "KILIX_YOLOX_SIZE"
+        "KILIX_YOLOX_SIZE", "KILIX_YOLOX_REF"
     };
     char root[KNVR_PATH_MAX];
     char camera_root[KNVR_PATH_MAX];
