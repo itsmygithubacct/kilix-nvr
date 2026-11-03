@@ -171,6 +171,11 @@ if 'kilix-nvr-prune.timer' in sys.argv and os.environ.get('FAIL_TIMER') in sys.a
         result = self.run_nvr("service", "install", binary=binary)
         self.assertEqual(result.returncode, 0, result.stderr)
         directory = self.home / ".config/systemd/user"
+        # Verify these units in a closed fixture graph. Loading the host's
+        # user targets also loads unrelated installed units and generators.
+        self.env["SYSTEMD_UNIT_PATH"] = str(directory)
+        for target in ("basic.target", "shutdown.target", "timers.target"):
+            (directory / target).write_text("[Unit]\nDescription=Fixture target\n")
         units = [str(directory / name) for name in
                  ("kilix-nvr.service", "kilix-nvr-prune.service", "kilix-nvr-prune.timer")]
         result = subprocess.run(["systemd-analyze", "--user", "verify", *units],

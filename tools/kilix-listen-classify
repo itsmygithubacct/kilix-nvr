@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""Run the verified sound provider without installation or selection writes."""
+import os
+import sys
+
+try:
+    os.execvp("kilix", ["kilix", "yamnet", "run", *sys.argv[1:]])
+except OSError as error:
+    print(f"kilix-nvr: cannot run the sound classifier: {error}. "
+          "Prepare it with 'kilix install yamnet', or configure "
+          "KILIX_SOUND_CLASSIFIER explicitly.", file=sys.stderr)
+    sys.exit(127)

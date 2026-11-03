@@ -297,3 +297,5 @@ and the detector handoff included.
 ## License
 
 MIT. See `LICENSE`.
+
+The bundled sound and object dispatchers enter `kilix yamnet run` and `kilix yolox run`. These commands verify existing runtimes without installing or changing selection. The recorder accepts all nine sound classes and continued sound refreshes its five-second event quiet interval. Sound can open an event without motion; preclusive motion zones still suppress object requests. Provider outages remain explicit, and the live view marks unavailable providers. Sound strips display PCM amplitude and therefore have no class-probability threshold line.

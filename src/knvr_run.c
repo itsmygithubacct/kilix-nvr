@@ -747,7 +747,7 @@ static void apply_detections(camera_run *run, knvr_store *store,
 
 static void listen(camera_run *run, knvr_store *store, bool verbose)
 {
-    ksd_event heard[8];
+    ksd_event heard[KSD_CLASS_COUNT];
     size_t count = 0u;
 
     if (run->sound == NULL) {
@@ -755,6 +755,8 @@ static void listen(camera_run *run, knvr_store *store, bool verbose)
             return;
         }
         if (!start_listener(run)) {
+            if (run->sound_restarts == 0u)
+                (void)fprintf(stderr, "kilix-nvr: %s: cannot start sound provider; retrying\n", run->name);
             run->sound_backoff = run->sound_backoff > 0
                                      ? run->sound_backoff * 2
                                      : SOUND_RETRY_MIN;
@@ -770,7 +772,7 @@ static void listen(camera_run *run, knvr_store *store, bool verbose)
         }
         return;
     }
-    if (!ksd_step(run->sound, heard, 8u, &count)) {
+    if (!ksd_step(run->sound, heard, KSD_CLASS_COUNT, &count)) {
         if (ksd_error(run->sound) != NULL) {
             /* Said once per outage, not once per attempt: a camera with
              * no audio at all would otherwise write a line every five
@@ -810,6 +812,9 @@ static void listen(camera_run *run, knvr_store *store, bool verbose)
             run->last_motion = (time_t)at;
             run->still_saved = false;
         }
+        /* Continued sound extends the same event's quiet interval, just
+         * as continued motion does. Otherwise a long sound is split. */
+        run->last_motion = (time_t)at;
         (void)memset(&record, 0, sizeof(record));
         record.event = run->event_id;
         record.at = at;

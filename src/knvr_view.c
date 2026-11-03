@@ -91,6 +91,8 @@ typedef struct feed {
     float sound_peak;
     float scores[KSD_CLASS_COUNT];
     bool online;
+    bool sound_failed;
+    bool detector_failed;
 } feed;
 
 /*
@@ -279,7 +281,6 @@ static bool feed_start(feed *at, const char *name, bool listen)
     }
     if (listen && at->attached == NULL) {
         ksd_options_init(&sound_options);
-        sound_options.min_score = 0.0f;   /* the view thresholds */
         if (knvr_paths_state_file(log_path, sizeof(log_path),
                                   "ffmpeg-audio.log")) {
             sound_options.log_path = log_path;
@@ -290,7 +291,7 @@ static bool feed_start(feed *at, const char *name, bool listen)
                                   "classify.log")) {
             sound_options.classifier_log_path = log_path;
         }
-        (void)ksd_open(&at->sound, url, &sound_options);
+        at->sound_failed = !ksd_open(&at->sound, url, &sound_options);
     }
     return true;
 }
@@ -326,7 +327,7 @@ static void feed_detector(feed *at, bool wanted)
     if (knvr_paths_state_file(log_path, sizeof(log_path), "detect.log")) {
         options.log_path = log_path;
     }
-    (void)kod_open(&at->detector, &options);
+    at->detector_failed = !kod_open(&at->detector, &options);
 }
 
 /*
@@ -406,6 +407,8 @@ static bool feed_step(feed *at, knvr_store *store)
                 at->sound_peak = level;
             }
         } else if (ksd_error(at->sound) != NULL) {
+            at->sound_failed = strcmp(ksd_error(at->sound), "the audio ended") != 0;
+            (void)memset(at->scores, 0, sizeof(at->scores));
             ksd_close(at->sound);
             at->sound = NULL;
         }
@@ -508,9 +511,14 @@ static bool feed_step(feed *at, knvr_store *store)
         crop_count = kod_regions(moved, moved_count, DECODE_W, DECODE_H, 320,
                                  crops, KOD_REGION_MAX, NULL);
         if (crop_count > 0u) {
-            (void)kod_detect_regions(at->detector, at->frame, DECODE_W,
+            if (!kod_detect_regions(at->detector, at->frame, DECODE_W,
                                      DECODE_H, crops, crop_count, at->boxes,
-                                     KOD_BOX_MAX, &at->box_count);
+                                     KOD_BOX_MAX, &at->box_count)) {
+                at->detector_failed = true;
+                at->box_count = 0;
+                kod_close(at->detector);
+                at->detector = NULL;
+            }
         }
     }
     /* Outlines from the module, so the recorder and the analyzer cannot
@@ -860,6 +868,12 @@ static void replay_step(replay *back)
 static void draw_labels(sr_canvas *canvas, const feed *at, int x, int y,
                         int width, int height)
 {
+    if (at->sound_failed || at->detector_failed) {
+        sr_text(canvas, (float)(x + 8), (float)(y + 28),
+                at->sound_failed && at->detector_failed ? "sound and detector unavailable" :
+                at->sound_failed ? "sound unavailable" : "detector unavailable",
+                0x00FF6060u, 1.0f, 1);
+    }
     for (size_t i = 0u; i < at->box_count; i++) {
         const kod_box *box = &at->boxes[i];
         const char *label = kod_label(box->class_id);
@@ -989,9 +1003,8 @@ static void draw_strips(sr_canvas *canvas, const feed *at, int x, int y,
     strip.label = compact ? NULL : "sound";
     strip.samples = sound;
     strip.colour = SOUND_COLOUR;
-    /* The default the classifier is thresholded at, drawn so the number
-     * is a thing you can see rather than one you have to remember. */
-    strip.threshold = 0.5f;
+    /* This is PCM amplitude, not an event-class probability. */
+    strip.threshold = -1.0f;
     knvr_strip_draw(canvas, &strip, x, y + (compact ? STRIP_H / 2 : STRIP_H),
                     width, compact ? STRIP_H / 2 : STRIP_H);
 }
@@ -1135,7 +1148,7 @@ static void compose_replay(sr_canvas *canvas, view *state)
     strip.label = "sound";
     strip.samples = back->day_audio;
     strip.colour = SOUND_COLOUR;
-    strip.threshold = 0.5f;
+    strip.threshold = -1.0f;
     knvr_strip_draw(canvas, &strip, 8, 32 + picture_h + 8 + STRIP_H, stage_w,
                     STRIP_H);
     sr_text(canvas, 72.0f, (float)(32 + picture_h + 12 + 2 * STRIP_H),

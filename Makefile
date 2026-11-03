@@ -124,7 +124,7 @@ $(BUILD_DIR)/test-%: tests/test_%.c $(STATIC_LIB) $(VENDOR_OBJECTS) | $(BUILD_DI
 
 # The command's own --selftest runs here too: it is the only check available
 # on a machine that has the program installed but not this source tree.
-test: $(TESTS) $(COMMAND)
+test: $(TESTS) $(COMMAND) $(BUILD_DIR)/test-consumer $(BUILD_DIR)/test-view_consumer
 	@set -e; for binary in $(TESTS); do \
 		printf '\n== %s ==\n' "$$binary"; \
 		"$$binary"; \
@@ -136,6 +136,8 @@ test: $(TESTS) $(COMMAND)
 	python3 tests/test_check.py "$(COMMAND)"; \
 	python3 tests/test_startup.py "$(COMMAND)"; \
 	python3 tests/test_detector_launcher.py; \
+	python3 tests/test_consumer.py; \
+	$(BUILD_DIR)/test-view_consumer; \
 	python3 tests/test_view_resize.py "$(COMMAND)"; \
 	$(MAKE) --no-print-directory test-install; \
 	printf '\nall test suites passed\n'
@@ -163,7 +165,7 @@ sanitize: clean
 
 # The object helper enters the installed YOLOX runtime through Kilix's model
 # and runtime checks. It never invokes the legacy model-fetching backend.
-INSTALL_TOOLS := $(KSD)/tools/kilix-listen-classify \
+INSTALL_TOOLS := tools/kilix-listen-classify \
 	$(KSD)/tools/kilix-sound-fetch-model \
 	tools/kilix-look-detect
 
