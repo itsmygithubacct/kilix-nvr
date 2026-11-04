@@ -117,6 +117,9 @@ if 'kilix-nvr-prune.timer' in sys.argv and os.environ.get('FAIL_TIMER') in sys.a
         self.env["KILIX_YAMNET_DIR"] = str(self.root / "sound runtime")
         self.env["KILIX_SOUND_PYTHON"] = "/usr/bin/python3"
         self.env["KILIX_SOUND_THRESHOLDS"] = str(self.root / "event policy")
+        for key in ("GPU_TERMINAL_HOME", "KILIX_HOME", "KILIX_STORAGE_HOME",
+                    "KILIX_DATA_HOME", "KILIX_LICENSE_RECEIPTS"):
+            self.env[key] = str(self.root / (key + " custom%path"))
         result = self.run_nvr("service", "install")
         self.assertEqual(result.returncode, 0, result.stderr)
         env_file = nvr / "state/service.env"
@@ -127,7 +130,9 @@ if 'kilix-nvr-prune.timer' in sys.argv and os.environ.get('FAIL_TIMER') in sys.a
         self.assertEqual(values["KILIX_RTSP_HOME"], str(rtsp))
         self.assertEqual(values["KILIX_OBJECT_DETECTOR"], detector)
         for key in ("GPU_TERMINAL_DATA_HOME", "KILIX_YOLOX_DIR", "KILIX_YOLOX_MODEL",
-                    "KILIX_YOLOX_REF", "KILIX_YAMNET_DIR", "KILIX_SOUND_PYTHON", "KILIX_SOUND_THRESHOLDS"):
+                    "KILIX_YOLOX_REF", "KILIX_YAMNET_DIR", "KILIX_SOUND_PYTHON", "KILIX_SOUND_THRESHOLDS",
+                    "GPU_TERMINAL_HOME", "KILIX_HOME", "KILIX_STORAGE_HOME",
+                    "KILIX_DATA_HOME", "KILIX_LICENSE_RECEIPTS"):
             self.assertEqual(values[key], self.env[key])
         for name in ("kilix-nvr.service", "kilix-nvr-prune.service"):
             unit = (self.home / ".config/systemd/user" / name).read_text()
