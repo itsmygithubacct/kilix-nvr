@@ -155,6 +155,49 @@ if 'kilix-nvr-prune.timer' in sys.argv and os.environ.get('FAIL_TIMER') in sys.a
         self.assertEqual(env_file.read_bytes(), original)
         self.assertFalse(self.calls.exists())
 
+    def test_service_snapshot_keeps_sound_content_authority_and_revocation(self):
+        self.prepare_existing_directories()
+        host = self.root / "fake host"
+        host.mkdir()
+        data = self.root / "fake content"
+        data.mkdir()
+        receipts = self.root / "fake receipts"
+        receipts.mkdir()
+        gate = receipts / "covered"
+        gate.touch()
+        launcher = host / "kilix"
+        launcher.write_text('''#!/usr/bin/env python3
+import os, pathlib, sys
+valid = (sys.argv[1:] == ['models', 'verify', 'yamnet'] and
+         pathlib.Path(os.environ['KILIX_DATA_HOME']).name == 'fake content' and
+         (pathlib.Path(os.environ['KILIX_LICENSE_RECEIPTS']) / 'covered').is_file())
+sys.exit(0 if valid else 1)
+''')
+        launcher.chmod(0o700)
+        nvr = self.root / "private nvr"
+        self.env.update(KILIX_NVR_HOME=str(nvr), KILIX_HOME=str(host),
+                        KILIX_DATA_HOME=str(data), KILIX_LICENSE_RECEIPTS=str(receipts))
+        installed = self.run_nvr("service", "install")
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        snapshot = nvr / "state/service.env"
+        values = dict(item.split("=", 1) for item in shlex.split(snapshot.read_text()))
+        self.assertEqual(snapshot.stat().st_mode & 0o777, 0o600)
+        # Run the real, read-only authority helper in only the service snapshot
+        # and a minimal system environment; the policy and receipt are fakes.
+        helper = Path(__file__).resolve().parents[1] / "third_party/kilix-sound-detect/tools"
+        code = ("import sys; sys.path.insert(0, sys.argv[1]); "
+                "from kilix_sound_runtime import require_content_authority; "
+                "require_content_authority()")
+        env = {"HOME": str(self.home), "PATH": "/usr/bin:/bin", **values}
+        def verify():
+            return subprocess.run([sys.executable, "-I", "-B", "-c", code, str(helper)],
+                                  env=env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(verify().returncode, 0)
+        gate.unlink()
+        denied = verify()
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertIn("covering licence receipt", denied.stderr)
+
     def test_executable_with_spaces_is_quoted(self):
         self.prepare_existing_directories()
         binary = self.root / "program files/nvr"
