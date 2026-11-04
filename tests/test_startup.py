@@ -206,7 +206,7 @@ sys.exit(0 if valid else 1)
         result = self.run_nvr("service", "install", binary=binary)
         self.assertEqual(result.returncode, 0, result.stderr)
         unit = (self.home / ".config/systemd/user/kilix-nvr.service").read_text()
-        self.assertIn('ExecStart="' + str(binary) + '" run', unit)
+        self.assertIn('ExecStart="' + str(binary.resolve()) + '" run', unit)
 
     @unittest.skipUnless(shutil.which("systemd-analyze"), "systemd parser unavailable")
     def test_generated_units_pass_the_systemd_parser_without_warnings(self):
