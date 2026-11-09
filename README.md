@@ -17,8 +17,10 @@ Recorder** (`kilix install kilix-nvr`) and has a system app, **Camera Wall**,
 that runs `kilix nvr view`. That pin, `e68b5d14`, is on the
 `work/023-rc1-closure` branch, nine commits ahead of `main`; this README
 describes `main`. No detector model ships with it: `kilix install yolox` and
-`kilix yamnet install` fetch the YOLOX and YAMNet models through Kilix Content
-on first use.
+`kilix yamnet install` build the detector runtimes and fetch the YOLOX and
+YAMNet models through Kilix Content on first use. On Plebian-OS 0.2.3 those
+models (`yolox_nano`, `yolox_s`, `yamnet`) are already installed at first boot
+from the ISO's offline default model bundle.
 
 ## What it does
 
@@ -169,8 +171,8 @@ install whose desktop is [Kilix](https://github.com/itsmygithubacct/kilix#readme
 running the [Kilix 95](https://github.com/itsmygithubacct/kilix-95#readme)
 desktop through [Pleb](https://github.com/itsmygithubacct/pleb#readme).
 It is a content-catalog app: Kilix fetches and builds a pinned commit when a
-user installs Camera Recorder or first runs `kilix nvr`, and detector models
-download on first use. The map of every repository and how it ships is on the
+user installs Camera Recorder or first runs `kilix nvr`. Its detector models
+come from the ISO's offline default model bundle at first boot. The map of every repository and how it ships is on the
 [components page](https://github.com/itsmygithubacct/plebian-os/blob/main/docs/components.md).
 
 ## License
