@@ -42,7 +42,12 @@ and presentation.
 ```sh
 git submodule update --init --recursive
 make && make test
+make install PREFIX="$HOME/.local"   # kilix-nvr, kilix-look-detect and the sound tools
 ```
+
+`make` alone leaves the command at `build/kilix-nvr`; the commands below assume
+it is on `PATH`. Inside Kilix, `kilix nvr ARGS` runs an installed `kilix-nvr`,
+or builds the commit Kilix pins the first time.
 
 Personal camera names, URLs, credentials, recordings, and deployment notes must stay outside this repository. Keep camera configuration in `~/.local/gpu_terminal/kilix-rtsp/config/cameras.conf` with mode `0600` and private parent directories. Repository examples use synthetic camera names.
 
